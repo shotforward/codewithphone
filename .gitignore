@@ -1,0 +1,25 @@
+# Build artifacts
+cwp-agent
+/bin/
+
+# Local data
+/data/
+/.cache/
+
+# Environment / secrets
+.env
+.env.*
+!.env.example
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Logs
+*.log

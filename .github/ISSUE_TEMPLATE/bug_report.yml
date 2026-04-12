@@ -1,0 +1,44 @@
+name: Bug report
+description: Report a reproducible bug in codewithphone daemon
+title: "[bug] "
+labels:
+  - bug
+body:
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: What happened?
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: Output of `codewithphone version`
+      placeholder: codewithphone 0.2.0
+    validations:
+      required: true
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: OS, shell, runtime tools (codex/claude/gemini)
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Reproduction steps
+      description: Exact steps to reproduce
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs
+      description: Paste sanitized logs (do not include tokens/secrets)

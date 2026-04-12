@@ -1,0 +1,101 @@
+name: daemon-ci
+
+on:
+  push:
+    paths:
+      - "cmd/**"
+      - "internal/**"
+      - "go.mod"
+      - "go.sum"
+      - "LICENSE"
+      - "NOTICE"
+      - "README.md"
+      - ".github/**"
+  pull_request:
+    paths:
+      - "cmd/**"
+      - "internal/**"
+      - "go.mod"
+      - "go.sum"
+      - "LICENSE"
+      - "NOTICE"
+      - "README.md"
+      - ".github/**"
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Verify gofmt
+        run: |
+          set -euo pipefail
+          files="$(find cmd internal -name '*.go' -print)"
+          if [ -z "${files}" ]; then
+            exit 0
+          fi
+          unformatted="$(gofmt -l ${files})"
+          if [ -n "${unformatted}" ]; then
+            echo "The following files are not gofmt-formatted:"
+            echo "${unformatted}"
+            exit 1
+          fi
+
+      - name: Unit tests
+        run: go test ./cmd/... ./internal/...
+
+      - name: Build
+        run: go build ./cmd/codewithphone
+
+  dco:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout full history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Verify DCO sign-off
+        run: |
+          set -euo pipefail
+          base_ref="${{ github.event.pull_request.base.ref }}"
+          git fetch origin "${base_ref}" --depth=1
+          commits="$(git rev-list --no-merges "origin/${base_ref}..HEAD")"
+          if [ -z "${commits}" ]; then
+            echo "No commits to validate."
+            exit 0
+          fi
+          failed=0
+          for commit in ${commits}; do
+            if ! git show -s --format=%B "${commit}" | grep -qi '^Signed-off-by:\s\+.*<.*>$'; then
+              echo "Missing DCO sign-off in commit: ${commit}"
+              failed=1
+            fi
+          done
+          if [ "${failed}" -ne 0 ]; then
+            echo "DCO check failed. Use: git commit -s"
+            exit 1
+          fi
+
+  license-policy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Verify Apache-2.0 policy files
+        run: |
+          set -euo pipefail
+          test -f LICENSE
+          test -f NOTICE
+          grep -q "Apache License" LICENSE
+          grep -q "Version 2.0, January 2004" LICENSE
+          grep -q "Apache License 2.0" README.md
