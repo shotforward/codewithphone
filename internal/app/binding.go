@@ -9,6 +9,7 @@ import (
 	"os"
 	"errors"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/shotforward/codewithphone/internal/config"
@@ -161,10 +162,14 @@ func (s *Service) runDeviceAuthFlow(ctx context.Context, hostname string) error 
 							log.Printf("binding local approval auto-approved by test mode")
 						} else {
 							fmt.Printf("\n  Binding request from %s (%s)\n", res.UserName, res.UserEmail)
-							fmt.Printf("  Approve? [y/n]: ")
-							// Use bufio.Scanner instead of fmt.Scanln —
-							// Scanln is fragile with terminal control chars
-							// and buffered newlines from prior input.
+							fmt.Printf("  Approve? [Y/n]: ")
+
+							// Drain any stale bytes in stdin (leftover
+							// newlines from prior prompts or terminal
+							// control sequences) before reading the
+							// user's actual answer.
+							drainStdin()
+
 							scanner := bufio.NewScanner(os.Stdin)
 							if scanner.Scan() {
 								raw := scanner.Text()
@@ -291,7 +296,8 @@ func parseBindingApprovalInput(input string) (bool, bool) {
 	}
 	value := strings.ToLower(strings.TrimSpace(string(cleaned)))
 	switch value {
-	case "y", "yes":
+	case "", "y", "yes":
+		// Empty input (just Enter) defaults to approve ([Y/n] convention).
 		return true, true
 	case "n", "no":
 		return false, true
@@ -303,6 +309,31 @@ func parseBindingApprovalInput(input string) (bool, bool) {
 			return true, true
 		}
 		return false, false
+	}
+}
+
+// drainStdin discards any bytes already buffered on stdin so that the
+// next scanner.Scan() blocks until the user types fresh input. Without
+// this, stale newlines from prior prompts or terminal control sequences
+// would be consumed immediately, causing the approval prompt to
+// auto-reject with an empty string.
+func drainStdin() {
+	// Set stdin to non-blocking temporarily to read & discard buffered bytes.
+	fd := int(os.Stdin.Fd())
+	// Use select/poll with zero timeout to check if data is available.
+	// Simpler approach: just set a very short read deadline isn't possible
+	// on os.Stdin (not a net.Conn). Instead, we use syscall.
+	var buf [256]byte
+	for {
+		// Use SetNonblock to read without waiting.
+		if err := syscall.SetNonblock(fd, true); err != nil {
+			break
+		}
+		n, _ := os.Stdin.Read(buf[:])
+		_ = syscall.SetNonblock(fd, false)
+		if n <= 0 {
+			break
+		}
 	}
 }
 

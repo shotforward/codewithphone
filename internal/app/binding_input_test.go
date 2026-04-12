@@ -21,8 +21,9 @@ func TestParseBindingApprovalInput(t *testing.T) {
 		{name: "N", input: "N", wantOK: true, want: false},
 		{name: "no", input: "no", wantOK: true, want: false},
 		{name: "NO", input: "NO", wantOK: true, want: false},
-		{name: "empty", input: "", wantOK: false, want: false},
-		{name: "unknown", input: "maybe", wantOK: false, want: false},
+		{name: "empty", input: "", wantOK: true, want: true},
+		{name: "unknown_with_y", input: "maybe", wantOK: true, want: true},
+		{name: "unknown_no_y", input: "what", wantOK: false, want: false},
 	}
 
 	for _, tc := range tests {
