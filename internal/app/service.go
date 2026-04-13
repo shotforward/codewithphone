@@ -167,6 +167,10 @@ func (s *Service) Run(ctx context.Context) error {
 		return fmt.Errorf("prepare daemon data directory: %w", err)
 	}
 
+	// Restore provider session refs from disk so daemon restarts can
+	// resume CLI sessions instead of starting fresh conversations.
+	s.loadSessionState()
+
 	// Log CLI tool versions at startup so operators can see at a glance
 	// whether any runner is out of the tested range.
 	CheckRunnerVersions(map[string]string{
@@ -367,6 +371,7 @@ func (s *Service) setProviderSession(sessionID, providerSessionRef string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.providerSessions[sessionID] = providerSessionRef
+	s.persistSessionState()
 }
 
 // pinSessionWorkspace records the first workspaceRoot used for a session and
@@ -378,7 +383,65 @@ func (s *Service) pinSessionWorkspace(sessionID, workspaceRoot string) string {
 		return existing
 	}
 	s.sessionWorkspaces[sessionID] = workspaceRoot
+	s.persistSessionState()
 	return workspaceRoot
+}
+
+// ── Session state persistence ──────────────────────────────────────
+//
+// Persists providerSessions and sessionWorkspaces to disk so that
+// daemon restarts can resume CLI sessions (--resume / thread/resume)
+// instead of starting fresh conversations.
+
+type sessionStateFile struct {
+	ProviderSessions  map[string]string `json:"providerSessions"`
+	SessionWorkspaces map[string]string `json:"sessionWorkspaces"`
+}
+
+func sessionStatePath() string {
+	return filepath.Join(config.HomeDir(), "sessions.json")
+}
+
+// persistSessionState writes the current session mappings to disk.
+// Caller must hold s.mu.
+func (s *Service) persistSessionState() {
+	data := sessionStateFile{
+		ProviderSessions:  s.providerSessions,
+		SessionWorkspaces: s.sessionWorkspaces,
+	}
+	body, err := json.Marshal(data)
+	if err != nil {
+		log.Printf("failed to marshal session state: %v", err)
+		return
+	}
+	if err := os.WriteFile(sessionStatePath(), body, 0o600); err != nil {
+		log.Printf("failed to persist session state: %v", err)
+	}
+}
+
+// loadSessionState restores provider session refs and workspace mappings
+// from disk. Called once at startup.
+func (s *Service) loadSessionState() {
+	body, err := os.ReadFile(sessionStatePath())
+	if err != nil {
+		return // file doesn't exist yet — first run
+	}
+	var data sessionStateFile
+	if err := json.Unmarshal(body, &data); err != nil {
+		log.Printf("failed to parse session state: %v", err)
+		return
+	}
+	if data.ProviderSessions != nil {
+		for k, v := range data.ProviderSessions {
+			s.providerSessions[k] = v
+		}
+	}
+	if data.SessionWorkspaces != nil {
+		for k, v := range data.SessionWorkspaces {
+			s.sessionWorkspaces[k] = v
+		}
+	}
+	log.Printf("restored %d provider sessions from disk", len(data.ProviderSessions))
 }
 
 func (s *Service) setTaskWorkspace(taskRunID, workspaceRoot string) {
