@@ -43,6 +43,11 @@ func normalizeRoots(inputs []string) []string {
 		if err != nil {
 			continue
 		}
+		// Resolve symlinks so that paths like /tmp (→ /private/tmp on
+		// macOS) match correctly against the canonical allowed root.
+		if resolved, err := filepath.EvalSymlinks(abs); err == nil {
+			abs = resolved
+		}
 		info, err := os.Stat(abs)
 		if err != nil || !info.IsDir() {
 			continue

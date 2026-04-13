@@ -122,7 +122,10 @@ func (r *claudeRunner) RunTurn(ctx context.Context, dispatch taskDispatch, provi
 		"--output-format", "stream-json",
 		"--verbose",
 		"--mcp-config", mcpConfigPath,
-		"--allowedTools", "mcp__pocketcode__run_command", "mcp__pocketcode__create_file",
+		"--allowedTools",
+		"mcp__pocketcode__run_command", "mcp__pocketcode__create_file",
+		"WebSearch", "WebFetch",
+		"Read", "Glob", "Grep",
 		"--permission-mode", "default",
 		"--system-prompt", systemPrompt,
 	}

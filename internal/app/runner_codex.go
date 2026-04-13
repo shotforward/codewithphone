@@ -300,6 +300,32 @@ func (r *codexRunner) handleAsyncMessage(ctx context.Context, rpc *codexRPCClien
 			},
 		})
 
+	case msg.Method == "error":
+		// Codex CLI sends async "error" notifications when something goes
+		// wrong (e.g. API key invalid, model error, rate limit). Log the
+		// full payload and emit turn.failed so the user sees the error
+		// instead of the turn hanging forever.
+		var errPayload struct {
+			Message string `json:"message"`
+			Code    string `json:"code"`
+		}
+		_ = json.Unmarshal(msg.Params, &errPayload)
+		errMsg := errPayload.Message
+		if errMsg == "" {
+			errMsg = string(msg.Params)
+		}
+		log.Printf("[CODEX] error notification: %s (code=%s, taskRun=%s)", errMsg, errPayload.Code, dispatch.TaskRunID)
+		r.deltaBuf.Flush(ctx)
+		r.closeAssistantStream(ctx, dispatch, state, "")
+		return true, r.server.postEvent(ctx, daemonEvent{
+			SessionID: dispatch.SessionID,
+			TaskRunID: dispatch.TaskRunID,
+			EventType: "turn.failed",
+			Payload: map[string]any{
+				"message": "Codex error: " + errMsg,
+			},
+		})
+
 	default:
 		// Defensive: log unknown methods so future Codex CLI additions are
 		// visible in daemon logs instead of being silently dropped.

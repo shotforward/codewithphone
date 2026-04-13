@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io/fs"
 	"log"
 	"os"
@@ -234,8 +235,12 @@ func (s *Service) executeListDirectories(requestedPath string, limit int, cursor
 	if err != nil {
 		return daemonMachineDirectoryListResponse{}, errors.New("path must be absolute")
 	}
+	// Resolve symlinks for consistent comparison (macOS: /tmp → /private/tmp).
+	if resolved, err := filepath.EvalSymlinks(targetPath); err == nil {
+		targetPath = resolved
+	}
 	if !daemonPathWithinAnyRoot(targetPath, allowedRoots) {
-		return daemonMachineDirectoryListResponse{}, errors.New("path is outside allowed roots")
+		return daemonMachineDirectoryListResponse{}, fmt.Errorf("path %q is outside allowed roots %v", targetPath, allowedRoots)
 	}
 	info, err := os.Stat(targetPath)
 	if err != nil {
@@ -516,9 +521,14 @@ func (s *Service) validateWorkspaceRoot(workspaceRoot string) (string, error) {
 	if err != nil {
 		return "", errors.New("workspace root is invalid")
 	}
+	// Resolve symlinks for consistent comparison with allowed roots
+	// (macOS: /tmp → /private/tmp, etc.).
+	if resolved, err := filepath.EvalSymlinks(absWorkspaceRoot); err == nil {
+		absWorkspaceRoot = resolved
+	}
 	allowedRoots := s.currentAllowedRoots()
 	if len(allowedRoots) > 0 && !daemonPathWithinAnyRoot(absWorkspaceRoot, allowedRoots) {
-		return "", errors.New("workspace root is outside allowed roots")
+		return "", fmt.Errorf("workspace root %q is outside allowed roots %v", absWorkspaceRoot, allowedRoots)
 	}
 	info, err := os.Stat(absWorkspaceRoot)
 	if err != nil {
