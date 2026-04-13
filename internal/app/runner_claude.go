@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/shotforward/codewithphone/internal/config"
@@ -143,6 +144,12 @@ func (r *claudeRunner) RunTurn(ctx context.Context, dispatch taskDispatch, provi
 	cmd := exec.CommandContext(ctx, r.claudeBin, args...)
 	cmd.Dir = dispatch.WorkspaceRoot
 	cmd.Env = os.Environ()
+	// Send SIGTERM instead of SIGKILL on context cancel so the CLI
+	// process can save its session state before exiting.
+	cmd.Cancel = func() error {
+		return cmd.Process.Signal(syscall.SIGTERM)
+	}
+	cmd.WaitDelay = 10 * time.Second // SIGKILL after 10s if still alive
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {

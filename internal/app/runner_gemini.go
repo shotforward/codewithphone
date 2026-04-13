@@ -18,6 +18,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/shotforward/codewithphone/internal/config"
@@ -261,6 +262,12 @@ deny_message = "No user interactive console is available. Use mcp_pocketcode_run
 	cmd := exec.CommandContext(ctx, r.geminiBin, args...)
 	cmd.Dir = dispatch.WorkspaceRoot
 	cmd.Env = append(os.Environ(), "GEMINI_CLI_HOME="+geminiHome)
+	// Send SIGTERM instead of SIGKILL on context cancel so the CLI
+	// process can save its session state before exiting.
+	cmd.Cancel = func() error {
+		return cmd.Process.Signal(syscall.SIGTERM)
+	}
+	cmd.WaitDelay = 10 * time.Second
 
 	// Ensure GEMINI_API_KEY is set when auth type is "gemini-api-key".
 	// The Gemini CLI's validateAuthMethod checks for this env var before

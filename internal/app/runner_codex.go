@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/shotforward/codewithphone/internal/config"
@@ -789,6 +790,12 @@ type codexRPCClient struct {
 
 func startCodexRPC(ctx context.Context, codexBin string) (*codexRPCClient, error) {
 	cmd := exec.CommandContext(ctx, codexBin, "app-server", "--listen", "stdio://")
+	// Send SIGTERM instead of SIGKILL on context cancel so the CLI
+	// process can save its session/thread state before exiting.
+	cmd.Cancel = func() error {
+		return cmd.Process.Signal(syscall.SIGTERM)
+	}
+	cmd.WaitDelay = 10 * time.Second
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		return nil, err

@@ -405,6 +405,33 @@ func (c serverClient) confirmBinding(ctx context.Context, code, confirmNonce str
 	return result.MachineToken, nil
 }
 
+func (c serverClient) fetchTaskStatus(ctx context.Context, taskRunID string) (string, error) {
+	url := strings.TrimRight(c.BaseURL, "/") + "/v1/machines/" + c.MachineID + "/tasks/" + taskRunID + "/status"
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Accept", "application/json")
+	if c.MachineToken != "" {
+		req.Header.Set("X-Machine-Token", c.MachineToken)
+	}
+	resp, err := c.httpClient().Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return "", newHTTPStatusError("fetch task status", resp)
+	}
+	var result struct {
+		Status string `json:"status"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(result.Status), nil
+}
+
 func (c serverClient) fetchSessionStatus(ctx context.Context, sessionID string) (string, error) {
 	url := strings.TrimRight(c.BaseURL, "/") + "/v1/sessions/" + sessionID
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)

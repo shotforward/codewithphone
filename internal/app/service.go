@@ -56,6 +56,7 @@ type Service struct {
 	actualAddr        string // resolved listen address (useful when port=0)
 	providerSessions  map[string]string
 	sessionWorkspaces map[string]string // sessionID -> first workspaceRoot
+	sessionLocks      map[string]*sync.Mutex // per-session lock for serial task execution
 	taskWorkspaces         map[string]string // taskRunID -> workspaceRoot
 	taskWorkspaceSnapshots map[string]string // taskRunID -> snapshot.Root for "vs turn start" diffs
 	taskProfiles           map[string]turnExecutionProfile
@@ -129,6 +130,7 @@ func New(cfg config.Config, opts ...Option) *Service {
 		interactive:       true, // default: foreground with terminal
 		providerSessions:  map[string]string{},
 		sessionWorkspaces: map[string]string{},
+		sessionLocks:      map[string]*sync.Mutex{},
 		taskWorkspaces:         map[string]string{},
 		taskWorkspaceSnapshots: map[string]string{},
 		taskProfiles:           map[string]turnExecutionProfile{},
@@ -365,6 +367,20 @@ func (s *Service) getProviderSession(sessionID string) string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.providerSessions[sessionID]
+}
+
+// getSessionLock returns a per-session mutex, creating one if needed.
+// Tasks for the same session are serialized through this lock so that
+// a stop command is fully processed before a new message starts.
+func (s *Service) getSessionLock(sessionID string) *sync.Mutex {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	lock, ok := s.sessionLocks[sessionID]
+	if !ok {
+		lock = &sync.Mutex{}
+		s.sessionLocks[sessionID] = lock
+	}
+	return lock
 }
 
 func (s *Service) setProviderSession(sessionID, providerSessionRef string) {

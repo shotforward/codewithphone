@@ -85,6 +85,12 @@ func (s *Service) handleCodexDispatch(ctx context.Context, dispatch taskDispatch
 }
 
 func (s *Service) handleRunnerDispatch(ctx context.Context, dispatch taskDispatch, runner turnRunner) error {
+	// Serialize tasks for the same session: wait for any previous task
+	// (including a cancelled one being drained) to finish before starting.
+	sessionLock := s.getSessionLock(dispatch.SessionID)
+	sessionLock.Lock()
+	defer sessionLock.Unlock()
+
 	dispatchStart := time.Now()
 	profile := planTurnExecution(dispatch.Prompt)
 	// Gemini session is directory-scoped; pin workspace before any task-scoped
@@ -129,7 +135,7 @@ func (s *Service) handleRunnerDispatch(ctx context.Context, dispatch taskDispatc
 	done := make(chan struct{})
 	defer close(done)
 	terminated := make(chan struct{})
-	go s.watchSessionTermination(taskCtx, dispatch.SessionID, cancel, done, terminated)
+	go s.watchSessionTermination(taskCtx, dispatch.SessionID, dispatch.TaskRunID, cancel, done, terminated)
 
 	t0 := time.Now()
 	if err := s.serverClient.postEvent(ctx, daemonEvent{
@@ -335,7 +341,7 @@ func (s *Service) handleRunnerDispatch(ctx context.Context, dispatch taskDispatc
 }
 
 
-func (s *Service) watchSessionTermination(ctx context.Context, sessionID string, cancel context.CancelFunc, done <-chan struct{}, terminated chan struct{}) {
+func (s *Service) watchSessionTermination(ctx context.Context, sessionID, taskRunID string, cancel context.CancelFunc, done <-chan struct{}, terminated chan struct{}) {
 	ticker := time.NewTicker(sessionTerminationPollInterval)
 	defer ticker.Stop()
 	for {
@@ -345,11 +351,21 @@ func (s *Service) watchSessionTermination(ctx context.Context, sessionID string,
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			status, err := s.serverClient.fetchSessionStatus(ctx, sessionID)
+			status, err := s.serverClient.fetchTaskStatus(ctx, taskRunID)
 			if err != nil {
+				// Fallback to session-level check for backward compatibility.
+				sessStatus, sessErr := s.serverClient.fetchSessionStatus(ctx, sessionID)
+				if sessErr != nil {
+					continue
+				}
+				if sessStatus == "terminated" {
+					cancel()
+					close(terminated)
+					return
+				}
 				continue
 			}
-			if status == "terminated" {
+			if status == "cancelled" {
 				cancel()
 				close(terminated)
 				return
