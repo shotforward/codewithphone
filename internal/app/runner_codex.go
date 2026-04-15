@@ -341,7 +341,7 @@ func (r *codexRunner) handleItemStarted(ctx context.Context, dispatch taskDispat
 		return err
 	}
 	switch itemType(payload.Item) {
-	case "Execution":
+	case "Execution", "commandExecution":
 		command := unwrapShellWrapperCommandText(itemString(payload.Item, "command"))
 		if isLikelyTestCommand(command) {
 			r.emitPhase(ctx, dispatch, state, turnPhaseTesting)
@@ -403,7 +403,7 @@ func (r *codexRunner) handleItemCompleted(ctx context.Context, dispatch taskDisp
 		}
 		r.closeAssistantStream(ctx, dispatch, state, itemString(payload.Item, "id"))
 		return nil
-	case "Execution":
+	case "Execution", "commandExecution":
 		state.completedCommandCount++
 		command := unwrapShellWrapperCommandText(itemString(payload.Item, "command"))
 		denyType := strings.TrimSpace(itemString(payload.Item, "denyType"))
