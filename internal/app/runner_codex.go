@@ -25,7 +25,6 @@ type codexRunner struct {
 	codexBin  string
 	server    *serverClient
 	approvals approvalClient
-	deltaBuf  *EventBuffer
 }
 
 type codexRPCMessage struct {
@@ -110,8 +109,13 @@ func newCodexRunner(cfg config.Config, server *serverClient) *codexRunner {
 }
 
 func (r *codexRunner) RunTurn(ctx context.Context, dispatch taskDispatch, providerSessionRef string, profile turnExecutionProfile) (sessionID string, err error) {
-	r.deltaBuf = NewEventBuffer(r.server, dispatch.SessionID, dispatch.TaskRunID)
-	defer r.deltaBuf.Close()
+	// deltaBuf MUST be a per-RunTurn local: the runner is a singleton shared
+	// across all concurrent task workers, so storing the buffer on the runner
+	// struct would let two sessions overwrite each other's session/task ids
+	// and cross-publish their assistant.delta events. The buffer is threaded
+	// down to handlers explicitly to make that invariant compile-checked.
+	deltaBuf := NewEventBuffer(r.server, dispatch.SessionID, dispatch.TaskRunID)
+	defer deltaBuf.Close()
 
 	t0 := time.Now()
 	rpc, rpcErr := startCodexRPC(ctx, r.codexBin)
@@ -159,13 +163,13 @@ func (r *codexRunner) RunTurn(ctx context.Context, dispatch taskDispatch, provid
 			},
 		},
 	}, func(msg codexRPCMessage) (bool, error) {
-		return r.handleAsyncMessage(ctx, rpc, dispatch, threadID, profile, state, msg)
+		return r.handleAsyncMessage(ctx, rpc, dispatch, threadID, profile, state, deltaBuf, msg)
 	}); err != nil {
 		return threadID, err
 	}
 	log.Printf("[TIMING] codex turn/start completed: %v", time.Since(t3))
 	if state.earlyFinalize {
-		r.deltaBuf.Flush(ctx)
+		deltaBuf.Flush(ctx)
 		r.closeAssistantStream(ctx, dispatch, state, "")
 		r.emitPhase(ctx, dispatch, state, turnPhaseFinalizing)
 		if err := profile.RunBeforeComplete(ctx); err != nil {
@@ -191,12 +195,12 @@ func (r *codexRunner) RunTurn(ctx context.Context, dispatch taskDispatch, provid
 		if err != nil {
 			return threadID, err
 		}
-		done, err := r.handleAsyncMessage(ctx, rpc, dispatch, threadID, profile, state, msg)
+		done, err := r.handleAsyncMessage(ctx, rpc, dispatch, threadID, profile, state, deltaBuf, msg)
 		if err != nil {
 			return threadID, err
 		}
 		if state.earlyFinalize {
-			r.deltaBuf.Flush(ctx)
+			deltaBuf.Flush(ctx)
 			r.closeAssistantStream(ctx, dispatch, state, "")
 			r.emitPhase(ctx, dispatch, state, turnPhaseFinalizing)
 			if err := profile.RunBeforeComplete(ctx); err != nil {
@@ -222,7 +226,7 @@ func (r *codexRunner) RunTurn(ctx context.Context, dispatch taskDispatch, provid
 	}
 }
 
-func (r *codexRunner) handleAsyncMessage(ctx context.Context, rpc *codexRPCClient, dispatch taskDispatch, threadID string, profile turnExecutionProfile, state *codexTurnState, msg codexRPCMessage) (bool, error) {
+func (r *codexRunner) handleAsyncMessage(ctx context.Context, rpc *codexRPCClient, dispatch taskDispatch, threadID string, profile turnExecutionProfile, state *codexTurnState, deltaBuf *EventBuffer, msg codexRPCMessage) (bool, error) {
 	switch {
 	case msg.Method == "turn/started":
 		return false, nil
@@ -234,14 +238,14 @@ func (r *codexRunner) handleAsyncMessage(ctx context.Context, rpc *codexRPCClien
 		}
 		r.openAssistantStream(ctx, dispatch, state, payload.ItemID)
 		r.emitPhase(ctx, dispatch, state, turnPhaseFinalizing)
-		r.deltaBuf.Append(ctx, payload.Delta, payload.ItemID)
+		deltaBuf.Append(ctx, payload.Delta, payload.ItemID)
 		return false, nil
 
 	case msg.Method == "item/started":
 		return false, r.handleItemStarted(ctx, dispatch, state, msg.Params)
 
 	case msg.Method == "item/completed":
-		return false, r.handleItemCompleted(ctx, dispatch, profile, state, msg.Params)
+		return false, r.handleItemCompleted(ctx, dispatch, profile, state, deltaBuf, msg.Params)
 
 	case msg.Method == "item/Execution/requestApproval":
 		return false, r.handleCommandApproval(ctx, dispatch, rpc, msg, profile, state)
@@ -271,7 +275,7 @@ func (r *codexRunner) handleAsyncMessage(ctx context.Context, rpc *codexRPCClien
 		if err := json.Unmarshal(msg.Params, &payload); err != nil {
 			return false, err
 		}
-		r.deltaBuf.Flush(ctx)
+		deltaBuf.Flush(ctx)
 		r.closeAssistantStream(ctx, dispatch, state, "")
 		r.emitPhase(ctx, dispatch, state, turnPhaseFinalizing)
 		if payload.Turn.Status == "completed" {
@@ -316,7 +320,7 @@ func (r *codexRunner) handleAsyncMessage(ctx context.Context, rpc *codexRPCClien
 			errMsg = string(msg.Params)
 		}
 		log.Printf("[CODEX] error notification: %s (code=%s, taskRun=%s)", errMsg, errPayload.Code, dispatch.TaskRunID)
-		r.deltaBuf.Flush(ctx)
+		deltaBuf.Flush(ctx)
 		r.closeAssistantStream(ctx, dispatch, state, "")
 		return true, r.server.postEvent(ctx, daemonEvent{
 			SessionID: dispatch.SessionID,
@@ -374,7 +378,7 @@ func (r *codexRunner) handleItemStarted(ctx context.Context, dispatch taskDispat
 	}
 }
 
-func (r *codexRunner) handleItemCompleted(ctx context.Context, dispatch taskDispatch, profile turnExecutionProfile, state *codexTurnState, raw json.RawMessage) error {
+func (r *codexRunner) handleItemCompleted(ctx context.Context, dispatch taskDispatch, profile turnExecutionProfile, state *codexTurnState, deltaBuf *EventBuffer, raw json.RawMessage) error {
 	var payload codexItemNotification
 	if err := json.Unmarshal(raw, &payload); err != nil {
 		return err
@@ -386,7 +390,7 @@ func (r *codexRunner) handleItemCompleted(ctx context.Context, dispatch taskDisp
 		text := itemString(payload.Item, "text")
 		// Flush buffered deltas before emitting completed text. This avoids
 		// late assistant.delta events appending duplicated trailing text in UI.
-		r.deltaBuf.Flush(ctx)
+		deltaBuf.Flush(ctx)
 		if err := r.server.postEvent(ctx, daemonEvent{
 			SessionID: dispatch.SessionID,
 			TaskRunID: dispatch.TaskRunID,

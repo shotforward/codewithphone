@@ -33,7 +33,6 @@ type geminiRunner struct {
 	resolveBaseURL func() string
 	server         *serverClient
 	approvals      approvalClient
-	deltaBuf       *EventBuffer
 }
 
 const (
@@ -147,8 +146,12 @@ func newGeminiRunner(cfg config.Config, server *serverClient, resolveBaseURL fun
 }
 
 func (r *geminiRunner) RunTurn(ctx context.Context, dispatch taskDispatch, providerSessionRef string, profile turnExecutionProfile) (string, error) {
-	r.deltaBuf = NewEventBuffer(r.server, dispatch.SessionID, dispatch.TaskRunID)
-	defer r.deltaBuf.Close()
+	// deltaBuf MUST be a per-RunTurn local: the runner is a singleton shared
+	// across all concurrent task workers, so storing the buffer on the runner
+	// struct would let two sessions overwrite each other's session/task ids
+	// and cross-publish their assistant.delta events.
+	deltaBuf := NewEventBuffer(r.server, dispatch.SessionID, dispatch.TaskRunID)
+	defer deltaBuf.Close()
 
 	runTurnStart := time.Now()
 	geminiHome, err := filepath.Abs(filepath.Join(r.sessionRoot, safeSessionDir(dispatch.SessionID)))
@@ -363,9 +366,9 @@ deny_message = "No user interactive console is available. Use mcp_pocketcode_run
 				streamOpen = true
 			}
 			if boolValue(raw["delta"]) {
-				r.deltaBuf.Append(ctx, text, itemID)
+				deltaBuf.Append(ctx, text, itemID)
 			} else {
-				r.deltaBuf.Flush(ctx)
+				deltaBuf.Flush(ctx)
 				if err := r.server.postEvent(ctx, daemonEvent{
 					SessionID: dispatch.SessionID,
 					TaskRunID: dispatch.TaskRunID,

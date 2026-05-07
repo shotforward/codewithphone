@@ -23,7 +23,6 @@ type claudeRunner struct {
 	resolveBaseURL func() string
 	server         *serverClient
 	approvals      approvalClient
-	deltaBuf       *EventBuffer
 }
 
 // claudeStreamEvent covers the stream-json events emitted by Claude Code CLI.
@@ -73,8 +72,12 @@ func newClaudeRunner(cfg config.Config, server *serverClient, resolveBaseURL fun
 }
 
 func (r *claudeRunner) RunTurn(ctx context.Context, dispatch taskDispatch, providerSessionRef string, profile turnExecutionProfile) (string, error) {
-	r.deltaBuf = NewEventBuffer(r.server, dispatch.SessionID, dispatch.TaskRunID)
-	defer r.deltaBuf.Close()
+	// deltaBuf MUST be a per-RunTurn local: the runner is a singleton shared
+	// across all concurrent task workers, so storing the buffer on the runner
+	// struct would let two sessions overwrite each other's session/task ids
+	// and cross-publish their assistant.delta events.
+	deltaBuf := NewEventBuffer(r.server, dispatch.SessionID, dispatch.TaskRunID)
+	defer deltaBuf.Close()
 
 	runTurnStart := time.Now()
 
@@ -232,12 +235,12 @@ func (r *claudeRunner) RunTurn(ctx context.Context, dispatch taskDispatch, provi
 			}
 			for _, block := range ev.Message.Content {
 				if block.Type == "text" && block.Text != "" {
-					r.deltaBuf.Append(ctx, block.Text, itemID)
+					deltaBuf.Append(ctx, block.Text, itemID)
 				}
 			}
 
 		case ev.Type == "result":
-			r.deltaBuf.Flush(ctx)
+			deltaBuf.Flush(ctx)
 			if ev.Result != "" {
 				itemID := strings.TrimSpace(currentAssistantItemID)
 				if itemID == "" {
