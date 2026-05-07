@@ -1,6 +1,21 @@
 # codewithphone
 
-Local AI agent runtime for [CodeWithPhone](https://codewithphone.com). Connects your machine to the CodeWithPhone platform so you can run AI coding tasks using Claude, Gemini, and Codex CLIs directly on your local environment.
+> AI coding agent runtime — drive Claude Code, Gemini CLI, and Codex CLI from
+> your phone or browser. Code stays on your machine; the agent runs locally.
+
+[![Release](https://img.shields.io/github/v/release/shotforward/codewithphone)](https://github.com/shotforward/codewithphone/releases)
+[![License](https://img.shields.io/github/license/shotforward/codewithphone)](LICENSE)
+[![Go Reference](https://pkg.go.dev/badge/github.com/shotforward/codewithphone.svg)](https://pkg.go.dev/github.com/shotforward/codewithphone)
+[![Go Report Card](https://goreportcard.com/badge/github.com/shotforward/codewithphone)](https://goreportcard.com/report/github.com/shotforward/codewithphone)
+[![Stars](https://img.shields.io/github/stars/shotforward/codewithphone?style=social)](https://github.com/shotforward/codewithphone/stargazers)
+
+`codewithphone` is the local agent runtime for [CodeWithPhone](https://codewithphone.com).
+It connects your machine to the CodeWithPhone platform so you can run AI coding
+tasks using **Claude Code**, **Gemini CLI**, and **Codex CLI** directly on your
+local environment — supervised from your phone, browser, or wherever you are.
+
+<!-- TODO: add a 30-second demo GIF at docs/demo.gif and reference it here.
+     High-impact for GitHub trending placement and Hacker News thumbnails. -->
 
 ## How it works
 
