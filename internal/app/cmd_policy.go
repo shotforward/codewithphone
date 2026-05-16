@@ -32,6 +32,11 @@ type normalizedCommand struct {
 	TimeoutSec  int      `json:"timeoutSec"`
 	Fingerprint string   `json:"fingerprint"`
 	RiskLevel   string   `json:"riskLevel"`
+
+	// PolicyDecision is the result of evaluating the command against the
+	// allow / deny ruleset (see cmd_policy_engine.go). It drives both the
+	// auto-approve gate and the deny-reason shown on the command card.
+	PolicyDecision commandPolicyDecision `json:"-"`
 }
 
 func normalizeRunCommand(req runCommandRequest) (normalizedCommand, error) {
@@ -69,46 +74,52 @@ func normalizeRunCommand(req runCommandRequest) (normalizedCommand, error) {
 		return normalizedCommand{}, err
 	}
 
+	decision := evaluatePolicySingle(executable, args)
 	return normalizedCommand{
-		Executable:  executable,
-		Args:        args,
-		CWD:         cleanCWD,
-		Reason:      strings.TrimSpace(req.Reason),
-		TimeoutSec:  timeoutSec,
-		Fingerprint: fingerprint,
-		RiskLevel:   classifyCommandRisk(executable, args),
+		Executable:     executable,
+		Args:           args,
+		CWD:            cleanCWD,
+		Reason:         strings.TrimSpace(req.Reason),
+		TimeoutSec:     timeoutSec,
+		Fingerprint:    fingerprint,
+		RiskLevel:      riskLevelForCategory(decision.Category),
+		PolicyDecision: decision,
 	}, nil
 }
 
 func normalizeCommandText(commandText, cwd, reason string) normalizedCommand {
-	commandText = strings.TrimSpace(commandText)
-	commandText = unwrapShellWrapperCommandText(commandText)
-	fields := splitShellWords(commandText)
+	rawCommand := strings.TrimSpace(commandText)
+	unwrapped := unwrapShellWrapperCommandText(rawCommand)
+	decision := evaluatePolicyScript(unwrapped)
+
+	fields := splitShellWords(unwrapped)
 	if len(fields) == 0 {
 		return normalizedCommand{
-			Executable:  commandText,
-			Args:        nil,
-			CWD:         safeRelativeCWD(cwd),
-			Reason:      strings.TrimSpace(reason),
-			TimeoutSec:  60,
-			Fingerprint: fallbackFingerprint(commandText, cwd),
-			RiskLevel:   riskLevelGuardedWrite,
+			Executable:     unwrapped,
+			Args:           nil,
+			CWD:            safeRelativeCWD(cwd),
+			Reason:         strings.TrimSpace(reason),
+			TimeoutSec:     60,
+			Fingerprint:    fallbackFingerprint(unwrapped, cwd),
+			RiskLevel:      riskLevelForCategory(decision.Category),
+			PolicyDecision: decision,
 		}
 	}
 
 	normalized := normalizedCommand{
-		Executable: canonicalExecutableName(fields[0]),
-		Args:       append([]string(nil), fields[1:]...),
-		CWD:        safeRelativeCWD(cwd),
-		Reason:     strings.TrimSpace(reason),
-		TimeoutSec: 60,
+		Executable:     canonicalExecutableName(fields[0]),
+		Args:           append([]string(nil), fields[1:]...),
+		CWD:            safeRelativeCWD(cwd),
+		Reason:         strings.TrimSpace(reason),
+		TimeoutSec:     60,
+		PolicyDecision: decision,
+		RiskLevel:      riskLevelForCategory(decision.Category),
 	}
 	if fingerprint, err := commandFingerprint(normalized.Executable, normalized.Args, normalized.CWD); err == nil {
 		normalized.Fingerprint = fingerprint
 	} else {
-		normalized.Fingerprint = fallbackFingerprint(commandText, cwd)
+		normalized.Fingerprint = fallbackFingerprint(unwrapped, cwd)
 	}
-	normalized.RiskLevel = classifyCommandTextRisk(commandText, normalized.Executable, normalized.Args)
 	return normalized
 }
 
@@ -132,152 +143,22 @@ func unwrapShellWrapperCommandText(commandText string) string {
 	return script
 }
 
+// classifyCommandRisk is a back-compat wrapper around the new policy engine.
+// New callers should use evaluatePolicy / evaluatePolicySingle directly and
+// look at the full commandPolicyDecision.
 func classifyCommandRisk(executable string, args []string) string {
-	executable = canonicalExecutableName(executable)
 	if script, ok := extractShellScript(executable, args); ok {
-		return classifyShellScriptRisk(script)
+		return riskLevelForCategory(evaluatePolicyScript(script).Category)
 	}
-	if hasWritableRedirection(args) {
-		return riskLevelGuardedWrite
-	}
-
-	switch executable {
-	case "rm", "sudo", "chmod", "chown":
-		return riskLevelDestructive
-	case "git":
-		return classifyGitRisk(args)
-	case "cat":
-		return classifyCatRisk(args)
-	case "sed":
-		return classifySedRisk(args)
-	case "find":
-		return classifyFindRisk(args)
-	case "xargs":
-		return classifyXargsRisk(args)
-	}
-
-	if safeReadExecutables[executable] {
-		return riskLevelSafeRead
-	}
-	return riskLevelGuardedWrite
-}
-
-func classifyCommandTextRisk(commandText, executable string, args []string) string {
-	if script, ok := extractShellScript(executable, args); ok {
-		return classifyShellScriptRisk(script)
-	}
-	return classifyCommandRisk(executable, args)
-}
-
-func classifyGitRisk(args []string) string {
-	if len(args) == 0 {
-		return riskLevelGuardedWrite
-	}
-	switch args[0] {
-	case "status", "diff", "show", "log", "rev-parse", "ls-files":
-		return riskLevelSafeRead
-	case "branch":
-		if len(args) == 1 || (len(args) == 2 && args[1] == "--show-current") {
-			return riskLevelSafeRead
-		}
-		return riskLevelGuardedWrite
-	case "remote":
-		if len(args) == 1 || (len(args) == 2 && args[1] == "-v") {
-			return riskLevelSafeRead
-		}
-		return riskLevelGuardedWrite
-	case "submodule":
-		if len(args) == 2 && args[1] == "status" {
-			return riskLevelSafeRead
-		}
-		return riskLevelGuardedWrite
-	case "reset":
-		for _, arg := range args[1:] {
-			if arg == "--hard" {
-				return riskLevelDestructive
-			}
-		}
-		return riskLevelGuardedWrite
-	case "clean":
-		return riskLevelDestructive
-	default:
-		return riskLevelGuardedWrite
-	}
-}
-
-func classifySedRisk(args []string) string {
-	for _, arg := range args {
-		if arg == "-i" || strings.HasPrefix(arg, "-i") {
-			return riskLevelGuardedWrite
-		}
-	}
-	return riskLevelSafeRead
-}
-
-func classifyFindRisk(args []string) string {
-	for _, arg := range args {
-		switch arg {
-		case "-delete":
-			return riskLevelDestructive
-		case "-exec", "-execdir", "-ok", "-okdir":
-			return riskLevelGuardedWrite
-		}
-	}
-	return riskLevelSafeRead
-}
-
-func classifyXargsRisk(args []string) string {
-	if len(args) == 0 {
-		return riskLevelGuardedWrite
-	}
-
-	commandIdx := -1
-	for idx, arg := range args {
-		if strings.HasPrefix(arg, "-") {
-			// Flags such as -r or -I keep xargs in orchestration mode.
-			continue
-		}
-		commandIdx = idx
-		break
-	}
-	if commandIdx == -1 {
-		return riskLevelGuardedWrite
-	}
-
-	return classifyCommandRisk(args[commandIdx], args[commandIdx+1:])
-}
-
-func classifyCatRisk(args []string) string {
-	if len(args) == 0 {
-		return riskLevelGuardedWrite
-	}
-	hasReadableInput := false
-	for idx := 0; idx < len(args); idx++ {
-		arg := strings.TrimSpace(args[idx])
-		if arg == "" {
-			continue
-		}
-		if isRedirectionLikeToken(arg) {
-			if isSafeDevNullRedirectToken(arg, idx, args) {
-				if isRedirectionOperatorToken(arg) {
-					idx++
-				}
-				continue
-			}
-			return riskLevelGuardedWrite
-		}
-		if strings.HasPrefix(arg, "-") && arg != "-" {
-			continue
-		}
-		hasReadableInput = true
-	}
-	if !hasReadableInput {
-		return riskLevelGuardedWrite
-	}
-	return riskLevelSafeRead
+	return riskLevelForCategory(evaluatePolicySingle(executable, args).Category)
 }
 
 func shouldAutoApprove(cmd normalizedCommand) bool {
+	if cmd.PolicyDecision.Category != "" {
+		return cmd.PolicyDecision.Allow
+	}
+	// Fallback path for any normalizedCommand built without going through
+	// the engine — defer to the legacy risk-level heuristic.
 	return cmd.RiskLevel == riskLevelSafeRead
 }
 
@@ -357,33 +238,6 @@ func extractShellScript(executable string, args []string) (string, bool) {
 	return "", true
 }
 
-func classifyShellScriptRisk(script string) string {
-	script = strings.TrimSpace(script)
-	if script == "" {
-		return riskLevelGuardedWrite
-	}
-
-	risk := riskLevelSafeRead
-	for _, segment := range splitShellSegments(script) {
-		segment = strings.TrimSpace(segment)
-		if segment == "" {
-			continue
-		}
-		executable, args, ok := extractSegmentCommand(segment)
-		if !ok {
-			return riskLevelGuardedWrite
-		}
-		segmentRisk := classifyCommandRisk(executable, args)
-		if segmentRisk == riskLevelDestructive {
-			return riskLevelDestructive
-		}
-		if segmentRisk == riskLevelGuardedWrite {
-			risk = riskLevelGuardedWrite
-		}
-	}
-	return risk
-}
-
 func splitShellSegments(script string) []string {
 	replacer := strings.NewReplacer("&&", "\n", "||", "\n", ";", "\n", "|", "\n")
 	return strings.Split(replacer.Replace(script), "\n")
@@ -429,43 +283,6 @@ func splitShellWords(input string) []string {
 	}
 	flush()
 	return fields
-}
-
-func extractSegmentCommand(segment string) (string, []string, bool) {
-	fields := splitShellWords(segment)
-	if len(fields) == 0 {
-		return "", nil, false
-	}
-
-	filtered := make([]string, 0, len(fields))
-	for idx := 0; idx < len(fields); idx++ {
-		field := fields[idx]
-		if strings.TrimSpace(field) == "" {
-			continue
-		}
-		if isRedirectionOperatorToken(field) {
-			if isSafeDevNullRedirectToken(field, idx, fields) {
-				idx++
-				continue
-			}
-			return "", nil, false
-		}
-		if isRedirectionLikeToken(field) {
-			if !isSafeDevNullRedirectToken(field, idx, fields) {
-				return "", nil, false
-			}
-			continue
-		}
-		if field == "2>/dev/null" || field == "1>/dev/null" || field == ">/dev/null" {
-			continue
-		}
-		filtered = append(filtered, field)
-	}
-
-	if len(filtered) == 0 {
-		return "", nil, false
-	}
-	return canonicalExecutableName(filtered[0]), filtered[1:], true
 }
 
 func hasWritableRedirection(args []string) bool {
@@ -534,23 +351,3 @@ func safeRelativeCWD(cwd string) string {
 	return cleanCWD
 }
 
-var safeReadExecutables = map[string]bool{
-	"pwd":      true,
-	"ls":       true,
-	"head":     true,
-	"tail":     true,
-	"wc":       true,
-	"du":       true,
-	"df":       true,
-	"find":     true,
-	"grep":     true,
-	"rg":       true,
-	"sed":      true,
-	"sort":     true,
-	"stat":     true,
-	"file":     true,
-	"tree":     true,
-	"which":    true,
-	"realpath": true,
-	"readlink": true,
-}

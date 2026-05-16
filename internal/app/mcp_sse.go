@@ -320,10 +320,14 @@ func (s *Service) executeRunCommandTool(ctx context.Context, req toolCallRequest
 
 	if profile, ok := s.getTaskProfile(req.TaskRunID); ok && !allowsCommandForProfile(profile, command) {
 		message := fmt.Sprintf("blocked in read-only turn: command risk level is %s", command.RiskLevel)
+		denyType := commandDenyTypePolicy
+		if engineType := strings.TrimSpace(command.PolicyDecision.DenyType); engineType != "" {
+			denyType = engineType
+		}
 		logMCPSSEAudit(req.SessionID, req.TaskRunID, toolName, "", commandRunID, "command_profile_gate", "blocked", nil)
 		_ = s.postCommandFinishedEvent(ctx, req, commandRunID, rawCommand, execCWD, commandExecutionResult{
 			Status:   "declined",
-			DenyType: commandDenyTypePolicy,
+			DenyType: denyType,
 			ExitCode: 1,
 			Output:   message,
 		}, "")
@@ -638,21 +642,31 @@ func (s *Service) awaitCommandApproval(ctx context.Context, req toolCallRequest,
 		})
 	}()
 
+	permPayload := map[string]any{
+		"approvalActionId":   actionID,
+		"commandRunId":       commandRunID,
+		"executable":         command.Executable,
+		"args":               command.Args,
+		"cwd":                command.CWD,
+		"rawCommand":         rawCommand,
+		"reason":             command.Reason,
+		"riskLevel":          command.RiskLevel,
+		"commandFingerprint": command.Fingerprint,
+	}
+	if cat := strings.TrimSpace(command.PolicyDecision.Category); cat != "" {
+		permPayload["policyCategory"] = cat
+	}
+	if reason := strings.TrimSpace(command.PolicyDecision.DenyReason); reason != "" {
+		permPayload["policyDenyReason"] = reason
+	}
+	if dt := strings.TrimSpace(command.PolicyDecision.DenyType); dt != "" {
+		permPayload["policyDenyType"] = dt
+	}
 	if err := s.serverClient.postEvent(ctx, daemonEvent{
 		SessionID: req.SessionID,
 		TaskRunID: req.TaskRunID,
 		EventType: "command.permission_requested",
-		Payload: map[string]any{
-			"approvalActionId":   actionID,
-			"commandRunId":       commandRunID,
-			"executable":         command.Executable,
-			"args":               command.Args,
-			"cwd":                command.CWD,
-			"rawCommand":         rawCommand,
-			"reason":             command.Reason,
-			"riskLevel":          command.RiskLevel,
-			"commandFingerprint": command.Fingerprint,
-		},
+		Payload:   permPayload,
 	}); err != nil {
 		return false, nil, err
 	}

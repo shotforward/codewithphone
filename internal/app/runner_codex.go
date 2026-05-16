@@ -593,6 +593,9 @@ func (r *codexRunner) handleCommandApproval(ctx context.Context, dispatch taskDi
 	if profile.ReadOnly && !allowsCommandForProfile(profile, command) {
 		decision = "decline"
 		denyType = commandDenyTypePolicy
+		if engineType := strings.TrimSpace(command.PolicyDecision.DenyType); engineType != "" {
+			denyType = engineType
+		}
 		declineMessage = "command blocked by read-only policy"
 		_ = emitTurnBlocked(ctx, r.server, dispatch, "awaiting_approval", map[string]any{
 			"mode":      "read_only_policy",
@@ -617,21 +620,31 @@ func (r *codexRunner) handleCommandApproval(ctx context.Context, dispatch taskDi
 				"approvalActionId": actionID,
 				"riskLevel":        command.RiskLevel,
 			})
+			permPayload := map[string]any{
+				"approvalActionId":   actionID,
+				"commandRunId":       commandRunID,
+				"executable":         command.Executable,
+				"args":               command.Args,
+				"cwd":                command.CWD,
+				"rawCommand":         rawCommand,
+				"reason":             command.Reason,
+				"riskLevel":          command.RiskLevel,
+				"commandFingerprint": command.Fingerprint,
+			}
+			if cat := strings.TrimSpace(command.PolicyDecision.Category); cat != "" {
+				permPayload["policyCategory"] = cat
+			}
+			if reason := strings.TrimSpace(command.PolicyDecision.DenyReason); reason != "" {
+				permPayload["policyDenyReason"] = reason
+			}
+			if dt := strings.TrimSpace(command.PolicyDecision.DenyType); dt != "" {
+				permPayload["policyDenyType"] = dt
+			}
 			if err := r.server.postEvent(ctx, daemonEvent{
 				SessionID: dispatch.SessionID,
 				TaskRunID: dispatch.TaskRunID,
 				EventType: "command.permission_requested",
-				Payload: map[string]any{
-					"approvalActionId":   actionID,
-					"commandRunId":       commandRunID,
-					"executable":         command.Executable,
-					"args":               command.Args,
-					"cwd":                command.CWD,
-					"rawCommand":         rawCommand,
-					"reason":             command.Reason,
-					"riskLevel":          command.RiskLevel,
-					"commandFingerprint": command.Fingerprint,
-				},
+				Payload:   permPayload,
 			}); err != nil {
 				decision = "decline"
 				declineMessage = "command approval failed: " + err.Error()
@@ -860,8 +873,9 @@ func (c *codexRPCClient) initialize(ctx context.Context) error {
 
 func (c *codexRPCClient) openThread(ctx context.Context, workspaceRoot, providerSessionRef string, profile turnExecutionProfile) (string, error) {
 	params := map[string]any{
-		"cwd":     workspaceRoot,
-		"sandbox": threadSandboxForProfile(profile),
+		"cwd":            workspaceRoot,
+		"sandbox":        threadSandboxForProfile(profile),
+		"approvalPolicy": approvalPolicyForProfile(profile),
 	}
 	if instructions := developerInstructionsForProfile(profile); instructions != "" {
 		params["developerInstructions"] = instructions
@@ -898,7 +912,24 @@ func threadSandboxForProfile(profile turnExecutionProfile) string {
 	if profile.ReadOnly {
 		return "read-only"
 	}
-	return "danger-full-access"
+	// workspace-write keeps Codex CLI's own boundary enforcement (writes
+	// inside workspace ok, escapes / network / risky ops route through
+	// item/Execution/requestApproval). The daemon-side handler then
+	// classifies via the policy engine and either auto-approves or shows
+	// a command card.
+	return "workspace-write"
+}
+
+// approvalPolicyForProfile controls when Codex CLI emits
+// item/Execution/requestApproval. "on-request" means: the CLI asks before
+// any command its sandbox rules would block; combined with workspace-write
+// sandbox, every escape attempt and network-touching command shows up as
+// a request the daemon can route to the user.
+func approvalPolicyForProfile(profile turnExecutionProfile) string {
+	if profile.ReadOnly {
+		return "on-request"
+	}
+	return "on-request"
 }
 
 func buildTurnPrompt(prompt string, profile turnExecutionProfile) string {
