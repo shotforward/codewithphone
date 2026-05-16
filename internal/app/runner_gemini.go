@@ -180,12 +180,6 @@ priority = 100
 deny_message = "Please use the daemon-approved mcp_pocketcode_run_command tool instead."
 
 [[rule]]
-toolName = "write_file"
-decision = "deny"
-priority = 100
-deny_message = "Please use the daemon-approved mcp_pocketcode_create_file tool instead."
-
-[[rule]]
 toolName = "ask_user"
 decision = "deny"
 priority = 100
@@ -229,11 +223,11 @@ deny_message = "No user interactive console is available. Use mcp_pocketcode_run
 	}
 
 	systemInstructions := `IMPORTANT TOOL USAGE RULES:
-- To execute shell commands, you MUST use the MCP tool "mcp_pocketcode_run_command" directly. This is the ONLY tool available for shell execution.
-- To write files, you MUST use the MCP tool "mcp_pocketcode_create_file" directly. This is the ONLY tool available for file writing.
-- Do NOT attempt to use "run_shell_command", "write_file", or any built-in shell/file tools — they are disabled.
-- Do NOT delegate shell command execution or file writes to sub-agents (e.g., generalist, codebase_investigator). Sub-agents cannot access MCP tools.
-- Always call MCP tools yourself in the main agent context.
+- To execute shell commands, you MUST use the MCP tool "mcp_pocketcode_run_command". The built-in "run_shell_command" is disabled — do not attempt to use it.
+- To write or modify files, use the built-in "write_file" and "replace" tools. Prefer "replace" for targeted in-place edits and "write_file" only for new files or full rewrites. File changes are tracked automatically through the workspace snapshot — no extra reporting needed.
+- Use "read_file", "glob", and "search_file_content" freely for inspection.
+- Do NOT delegate shell command execution to sub-agents (e.g., generalist, codebase_investigator). Sub-agents cannot access MCP tools.
+- Always call tools yourself in the main agent context.
 - For long-running service commands (dev server, start/serve, docker compose up, watch, tail -f), call run_command with executionMode="auto" and waitTimeoutSec=120.
 
 `

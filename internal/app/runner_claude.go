@@ -110,10 +110,22 @@ func (r *claudeRunner) RunTurn(ctx context.Context, dispatch taskDispatch, provi
 	}
 	defer os.Remove(mcpConfigPath)
 
+	// Install per-task PostToolUse + PreToolUse hooks into the workspace's
+	// .claude/settings.local.json so Claude reports native Write/Edit calls
+	// back to the daemon (for inline diff cards) and refuses to touch paths
+	// outside the workspace. Original settings.local.json is backed up and
+	// restored on turn exit.
+	claudeHookCleanup, claudeHookErr := installClaudeWorkspaceHooks(dispatch.WorkspaceRoot)
+	if claudeHookErr != nil {
+		log.Printf("[CLAUDE-HOOK] install failed taskRun=%s: %v", dispatch.TaskRunID, claudeHookErr)
+	}
+	defer claudeHookCleanup()
+
 	systemPrompt := `IMPORTANT TOOL USAGE RULES:
-- To execute shell commands, you MUST use the MCP tool "mcp_pocketcode_run_command" directly.
-- To write files, you MUST use the MCP tool "mcp_pocketcode_create_file" directly.
-- Always call MCP tools yourself in the main agent context.
+- To execute shell commands, you MUST use the MCP tool "mcp_pocketcode_run_command". Do NOT use Bash.
+- To write or modify files, use the native Edit, Write, MultiEdit, or NotebookEdit tools. Prefer Edit for targeted in-place changes; use Write only when creating a new file or fully overwriting it.
+- Use Read, Grep, and Glob freely for inspection.
+- Always call tools yourself in the main agent context — do not delegate to sub-agents.
 - For long-running service commands (dev server, start/serve, docker compose up, watch, tail -f), set executionMode="auto" and waitTimeoutSec=120 when calling run_command.
 `
 	prompt := dispatch.Prompt
@@ -127,9 +139,10 @@ func (r *claudeRunner) RunTurn(ctx context.Context, dispatch taskDispatch, provi
 		"--verbose",
 		"--mcp-config", mcpConfigPath,
 		"--allowedTools",
-		"mcp__pocketcode__run_command", "mcp__pocketcode__create_file",
-		"WebSearch", "WebFetch",
+		"mcp__pocketcode__run_command",
+		"Edit", "Write", "MultiEdit", "NotebookEdit",
 		"Read", "Glob", "Grep",
+		"WebSearch", "WebFetch",
 		"--permission-mode", "default",
 		"--system-prompt", systemPrompt,
 	}
@@ -146,7 +159,12 @@ func (r *claudeRunner) RunTurn(ctx context.Context, dispatch taskDispatch, provi
 
 	cmd := exec.CommandContext(ctx, r.claudeBin, args...)
 	cmd.Dir = dispatch.WorkspaceRoot
-	cmd.Env = os.Environ()
+	cmd.Env = append(os.Environ(),
+		"POCKETCODE_MCP_DAEMON_URL="+baseURL,
+		"POCKETCODE_MCP_SESSION_ID="+dispatch.SessionID,
+		"POCKETCODE_MCP_TASK_RUN_ID="+dispatch.TaskRunID,
+		"POCKETCODE_TASK_WORKSPACE="+dispatch.WorkspaceRoot,
+	)
 	// Send SIGTERM instead of SIGKILL on context cancel so the CLI
 	// process can save its session state before exiting.
 	cmd.Cancel = func() error {

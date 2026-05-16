@@ -198,6 +198,7 @@ func (s *Service) Run(ctx context.Context) error {
 	mux.HandleFunc("GET /healthz", s.handleHealth)
 	mux.HandleFunc("GET /v1/runtime/state", s.handleRuntimeState)
 	mux.HandleFunc("POST /internal/mcp/tool_call", s.handleMCPToolCall)
+	mux.HandleFunc("POST /internal/file/touched", s.handleFileTouchedHook)
 	mux.HandleFunc("GET /mcp/sse", s.handleMCPSSE)
 	mux.HandleFunc("POST /mcp/message", s.handleMCPMessage)
 

@@ -35,6 +35,10 @@ func main() {
 		cmdStatus()
 	case "mcp-stdio":
 		app.RunMCPStdio()
+	case "hook-claude-file-touched":
+		app.RunHookClaudeFileTouched()
+	case "hook-claude-preflight":
+		app.RunHookClaudePreflight()
 	case "version", "--version", "-v":
 		fmt.Printf("codewithphone %s\n", version)
 	case "help", "--help", "-h":
