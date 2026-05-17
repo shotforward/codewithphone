@@ -247,7 +247,14 @@ func (r *codexRunner) handleAsyncMessage(ctx context.Context, rpc *codexRPCClien
 	case msg.Method == "item/completed":
 		return false, r.handleItemCompleted(ctx, dispatch, profile, state, deltaBuf, msg.Params)
 
-	case msg.Method == "item/Execution/requestApproval":
+	case msg.Method == "item/Execution/requestApproval" ||
+		msg.Method == "item/commandExecution/requestApproval":
+		// Codex CLI renamed the item type from "Execution" to
+		// "commandExecution" at some point; the same drift previously hit
+		// item/started + item/completed (see handleItemStarted /
+		// handleItemCompleted's dual-case match). Without matching both,
+		// requestApproval falls into the default branch and the CLI hangs
+		// forever waiting for an accept/decline response.
 		return false, r.handleCommandApproval(ctx, dispatch, rpc, msg, profile, state)
 
 	case msg.Method == "item/fileChange/requestApproval":
@@ -263,7 +270,8 @@ func (r *codexRunner) handleAsyncMessage(ctx context.Context, rpc *codexRPCClien
 
 	case msg.Method == "item/permissions/requestApproval":
 		// Security default: do not session-grant broad permission bundles.
-		// Command execution should flow through item/Execution/requestApproval.
+		// Command execution should flow through
+		// item/{Execution,commandExecution}/requestApproval.
 		permissions := map[string]any{}
 		return false, rpc.respond(msg.ID, map[string]any{
 			"permissions": permissions,
@@ -914,14 +922,14 @@ func threadSandboxForProfile(profile turnExecutionProfile) string {
 	}
 	// workspace-write keeps Codex CLI's own boundary enforcement (writes
 	// inside workspace ok, escapes / network / risky ops route through
-	// item/Execution/requestApproval). The daemon-side handler then
-	// classifies via the policy engine and either auto-approves or shows
-	// a command card.
+	// item/{Execution,commandExecution}/requestApproval). The daemon-side
+	// handler then classifies via the policy engine and either
+	// auto-approves or shows a command card.
 	return "workspace-write"
 }
 
 // approvalPolicyForProfile controls when Codex CLI emits
-// item/Execution/requestApproval. "on-request" means: the CLI asks before
+// item/commandExecution/requestApproval. "on-request" means: the CLI asks before
 // any command its sandbox rules would block; combined with workspace-write
 // sandbox, every escape attempt and network-touching command shows up as
 // a request the daemon can route to the user.
