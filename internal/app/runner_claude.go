@@ -40,6 +40,12 @@ type claudeStreamEvent struct {
 	Result     string `json:"result,omitempty"`
 	IsError    bool   `json:"is_error,omitempty"`
 	StopReason string `json:"stop_reason,omitempty"`
+
+	// stream_event — only emitted when `--include-partial-messages` is
+	// passed. These are raw Anthropic stream events (message_start,
+	// content_block_delta, message_stop, ...). The content_block_delta /
+	// text_delta variant is the one we forward as incremental UI deltas.
+	Event *claudeRawStreamEvent `json:"event,omitempty"`
 }
 
 type claudeMessage struct {
@@ -54,6 +60,22 @@ type claudeBlock struct {
 	Name  string          `json:"name,omitempty"`
 	ID    string          `json:"id,omitempty"`
 	Input json.RawMessage `json:"input,omitempty"`
+}
+
+// claudeRawStreamEvent mirrors the Anthropic Messages API streaming event
+// schema that Claude Code re-emits under a top-level
+// `{"type":"stream_event","event":{...}}` envelope when
+// --include-partial-messages is enabled.
+type claudeRawStreamEvent struct {
+	Type  string           `json:"type"`            // message_start / content_block_delta / message_stop / ...
+	Index int              `json:"index,omitempty"` // content block index
+	Delta *claudeRawDelta  `json:"delta,omitempty"`
+}
+
+type claudeRawDelta struct {
+	Type        string `json:"type"`                  // text_delta / input_json_delta / ...
+	Text        string `json:"text,omitempty"`
+	PartialJSON string `json:"partial_json,omitempty"`
 }
 
 func newClaudeRunner(cfg config.Config, server *serverClient, resolveBaseURL func() string) *claudeRunner {
@@ -136,6 +158,14 @@ func (r *claudeRunner) RunTurn(ctx context.Context, dispatch taskDispatch, provi
 	args := []string{
 		"-p", prompt,
 		"--output-format", "stream-json",
+		// Without --include-partial-messages, Claude Code emits one
+		// `{"type":"assistant","message":...}` snapshot per turn at the
+		// end of generation, which makes long answers land all at once
+		// in the UI. The flag opts into Anthropic-style stream events
+		// (`{"type":"stream_event","event":{...}}` with
+		// content_block_delta / text_delta) so we can forward
+		// token-level deltas as they arrive.
+		"--include-partial-messages",
 		"--verbose",
 		"--mcp-config", mcpConfigPath,
 		"--allowedTools",
@@ -235,25 +265,54 @@ func (r *claudeRunner) RunTurn(ctx context.Context, dispatch taskDispatch, provi
 				sessionID = ev.SessionID
 			}
 
+		case ev.Type == "stream_event" && ev.Event != nil:
+			// Token-level streaming path (requires --include-partial-messages).
+			// We only forward text deltas; tool_use input deltas and other
+			// raw events are tracked by the snapshot `assistant` event below.
+			if ev.Event.Type == "content_block_delta" && ev.Event.Delta != nil &&
+				ev.Event.Delta.Type == "text_delta" && ev.Event.Delta.Text != "" {
+				if !streamOpen {
+					_ = emitAssistantStreamStarted(ctx, r.server, dispatch, dispatch.TaskRunID)
+					_ = emitTurnPhase(ctx, r.server, dispatch, turnPhaseFinalizing, nil)
+					streamOpen = true
+				}
+				itemID := strings.TrimSpace(currentAssistantItemID)
+				if itemID == "" {
+					fallbackAssistantIndex++
+					currentAssistantItemID = fmt.Sprintf("%s:assistant:%d", dispatch.TaskRunID, fallbackAssistantIndex)
+					itemID = currentAssistantItemID
+				}
+				deltaBuf.Append(ctx, ev.Event.Delta.Text, itemID)
+			}
+
 		case ev.Type == "assistant" && ev.Message != nil:
+			// End-of-turn snapshot. With --include-partial-messages enabled
+			// the text has already been streamed via stream_event above, so
+			// we only use this event to capture the canonical message.id —
+			// re-appending the snapshot text would duplicate the assistant
+			// reply in the timeline buffer.
+			itemID := strings.TrimSpace(ev.Message.ID)
+			if itemID != "" {
+				currentAssistantItemID = itemID
+			}
 			if !streamOpen {
+				// Defensive fallback: if no stream_event arrived (e.g. a
+				// Claude build without partial-message support, or the
+				// model produced no text), open the stream now and emit
+				// the snapshot text so the UI still sees the reply.
 				_ = emitAssistantStreamStarted(ctx, r.server, dispatch, dispatch.TaskRunID)
 				_ = emitTurnPhase(ctx, r.server, dispatch, turnPhaseFinalizing, nil)
 				streamOpen = true
-			}
-			itemID := strings.TrimSpace(ev.Message.ID)
-			if itemID == "" {
-				if strings.TrimSpace(currentAssistantItemID) == "" {
+				flushItemID := strings.TrimSpace(currentAssistantItemID)
+				if flushItemID == "" {
 					fallbackAssistantIndex++
 					currentAssistantItemID = fmt.Sprintf("%s:assistant:%d", dispatch.TaskRunID, fallbackAssistantIndex)
+					flushItemID = currentAssistantItemID
 				}
-				itemID = currentAssistantItemID
-			} else {
-				currentAssistantItemID = itemID
-			}
-			for _, block := range ev.Message.Content {
-				if block.Type == "text" && block.Text != "" {
-					deltaBuf.Append(ctx, block.Text, itemID)
+				for _, block := range ev.Message.Content {
+					if block.Type == "text" && block.Text != "" {
+						deltaBuf.Append(ctx, block.Text, flushItemID)
+					}
 				}
 			}
 
