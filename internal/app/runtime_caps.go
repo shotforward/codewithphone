@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -20,13 +22,16 @@ type runtimeCapabilitiesPayload struct {
 }
 
 type runtimeCapabilityPayload struct {
-	Runtime      string   `json:"runtime"`
-	CLIVersion   string   `json:"cliVersion,omitempty"`
-	Models       []string `json:"models,omitempty"`
-	DefaultModel string   `json:"defaultModel,omitempty"`
-	Discoverable bool     `json:"discoverable"`
-	ProbeError   string   `json:"probeError,omitempty"`
-	ProbedAt     string   `json:"probedAt,omitempty"`
+	Runtime          string   `json:"runtime"`
+	CLIVersion       string   `json:"cliVersion,omitempty"`
+	LatestCLIVersion string   `json:"latestCliVersion,omitempty"`
+	UpdateAvailable  bool     `json:"updateAvailable,omitempty"`
+	UpdateCommand    string   `json:"updateCommand,omitempty"`
+	Models           []string `json:"models,omitempty"`
+	DefaultModel     string   `json:"defaultModel,omitempty"`
+	Discoverable     bool     `json:"discoverable"`
+	ProbeError       string   `json:"probeError,omitempty"`
+	ProbedAt         string   `json:"probedAt,omitempty"`
 }
 
 const probeCommandTimeout = 4 * time.Second
@@ -41,6 +46,14 @@ var ansiEscapePattern = regexp.MustCompile(`\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\a
 var resolveHomeDir = os.UserHomeDir
 
 var geminiModelsAPIURL = "https://generativelanguage.googleapis.com/v1beta/models"
+
+// codexNpmRegistryURL is the npm registry endpoint that exposes the
+// latest published version of the Codex CLI. It is overridable so tests
+// can point at an httptest server without hitting the real network.
+var codexNpmRegistryURL = "https://registry.npmjs.org/@openai/codex/latest"
+
+const codexNpmPackage = "@openai/codex"
+const codexUpdateCommand = "npm install -g @openai/codex@latest"
 
 // ---------------------------------------------------------------------------
 // Known model tables & fallbacks
@@ -130,6 +143,8 @@ func cloneRuntimeCapabilities(in runtimeCapabilitiesPayload) runtimeCapabilities
 func normalizeRuntimeCapability(cap runtimeCapabilityPayload) runtimeCapabilityPayload {
 	cap.Runtime = strings.TrimSpace(cap.Runtime)
 	cap.CLIVersion = strings.TrimSpace(cap.CLIVersion)
+	cap.LatestCLIVersion = strings.TrimSpace(cap.LatestCLIVersion)
+	cap.UpdateCommand = strings.TrimSpace(cap.UpdateCommand)
 	cap.DefaultModel = strings.TrimSpace(cap.DefaultModel)
 	cap.ProbeError = strings.TrimSpace(cap.ProbeError)
 	cap.ProbedAt = strings.TrimSpace(cap.ProbedAt)
@@ -383,6 +398,92 @@ func probeCodexModels(_ context.Context, _ config.Config) ([]string, bool, error
 }
 
 // ---------------------------------------------------------------------------
+// Codex CLI update detection
+// ---------------------------------------------------------------------------
+//
+// We do NOT auto-update the Codex CLI for the user — keeping daemon and CLI
+// decoupled means the user remains in control of their toolchain. Instead we
+// detect when their installed CLI is older than the latest published npm
+// release and surface an update hint via the capability payload, so the UI
+// can show a non-blocking notice ("Codex CLI X is out — run `npm install -g
+// @openai/codex@latest` to unlock new models").
+
+// fetchCodexLatestVersion queries the npm registry for the latest published
+// version of @openai/codex. Best-effort: returns ("", err) on any failure
+// (network, status, malformed JSON, etc.).
+func fetchCodexLatestVersion(ctx context.Context) (string, error) {
+	reqCtx, cancel := context.WithTimeout(ctx, httpProbeTimeout)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, codexNpmRegistryURL, nil)
+	if err != nil {
+		return "", fmt.Errorf("build registry request: %w", err)
+	}
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("User-Agent", "pocketcode-daemon/runtime-caps")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("npm registry request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return "", fmt.Errorf("npm registry status %d", resp.StatusCode)
+	}
+
+	var payload struct {
+		Version string `json:"version"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		return "", fmt.Errorf("decode registry payload: %w", err)
+	}
+	version := strings.TrimSpace(payload.Version)
+	if version == "" {
+		return "", errors.New("npm registry returned empty version")
+	}
+	return version, nil
+}
+
+// checkCodexUpdate looks up the latest Codex CLI version and compares it
+// against the installed version. It is best-effort: any failure returns
+// zero values (no update info) and only logs a warning so the rest of the
+// capability payload is unaffected.
+//
+// installedRaw is the raw `--version` output captured earlier (e.g.
+// "codex-cli 0.118.0"). We reuse extractVersionNumber from runner_version.go
+// to parse it, and compareVersions for the comparison.
+func checkCodexUpdate(ctx context.Context, installedRaw string) (latest string, updateAvailable bool, updateCommand string) {
+	if strings.TrimSpace(installedRaw) == "" {
+		// No installed version means version probe failed; skip the update
+		// check entirely (avoids hitting the network for a missing CLI).
+		return "", false, ""
+	}
+	latestRaw, err := fetchCodexLatestVersion(ctx)
+	if err != nil {
+		log.Printf("[capabilities] codex update check skipped: %v", err)
+		return "", false, ""
+	}
+	installed := extractVersionNumber(installedRaw)
+	// extractVersionNumber falls back to the raw string when it cannot
+	// locate a semver-shaped token, so an exotic --version output could
+	// reach compareVersions where Sscanf silently coerces non-numeric
+	// segments to 0 and triggers a false "update available". Validate
+	// that the first dotted segment is digit-only before trusting the
+	// comparison.
+	parts := strings.Split(installed, ".")
+	if installed == "" || len(parts) < 2 || !isDigits(parts[0]) {
+		// Surface the latest for visibility but don't claim an update is
+		// available — we have no meaningful baseline to compare against.
+		return latestRaw, false, ""
+	}
+	if compareVersions(installed, latestRaw) < 0 {
+		return latestRaw, true, codexUpdateCommand
+	}
+	return latestRaw, false, ""
+}
+
+// ---------------------------------------------------------------------------
 // Strategy: Gemini – static known models
 // ---------------------------------------------------------------------------
 //
@@ -514,6 +615,15 @@ func detectRuntimeCapabilities(ctx context.Context, cfg config.Config) runtimeCa
 		if err != nil {
 			cap.ProbeError = appendProbeError(cap.ProbeError, fmt.Sprintf("model probe: %s", classifyProbeError(err)))
 		}
+
+		// Per-runtime update detection. Best-effort and decoupled from model
+		// discovery: the daemon never auto-updates a CLI, it just surfaces an
+		// "update available" hint so the UI can prompt the user.
+		switch cap.Runtime {
+		case "codex_cli":
+			cap.LatestCLIVersion, cap.UpdateAvailable, cap.UpdateCommand = checkCodexUpdate(ctx, cap.CLIVersion)
+		}
+
 		out.Runtimes = append(out.Runtimes, normalizeRuntimeCapability(cap))
 	}
 	return normalizeRuntimeCapabilities(out)
@@ -530,7 +640,7 @@ func (s *Service) getRuntimeCapabilities() runtimeCapabilitiesPayload {
 }
 
 func (s *Service) refreshRuntimeCapabilities(ctx context.Context) {
-	innerCtx, cancel := context.WithTimeout(ctx, 12*time.Second)
+	innerCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
 	defer cancel()
 	caps := detectRuntimeCapabilities(innerCtx, s.cfg)
 	s.mu.Lock()
