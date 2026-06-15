@@ -15,8 +15,8 @@ func resolveAllowedRoots() []string {
 		}
 	}
 
-	home := strings.TrimSpace(os.Getenv("HOME"))
-	if home != "" {
+	if home, err := os.UserHomeDir(); err == nil {
+		home = strings.TrimSpace(home)
 		if roots := normalizeRoots([]string{home}); len(roots) > 0 {
 			return roots
 		}
@@ -29,6 +29,29 @@ func resolveAllowedRoots() []string {
 	}
 
 	return []string{"."}
+}
+
+func preferredWorkspaceRoot(allowedRoots []string) string {
+	if home, err := os.UserHomeDir(); err == nil {
+		home = strings.TrimSpace(home)
+		if home != "" {
+			if roots := normalizeRoots([]string{home}); len(roots) > 0 {
+				home = roots[0]
+				for _, root := range allowedRoots {
+					if root == home {
+						return root
+					}
+				}
+			}
+		}
+	}
+	if len(allowedRoots) > 0 {
+		return allowedRoots[0]
+	}
+	if cwd, err := os.Getwd(); err == nil {
+		return cwd
+	}
+	return "."
 }
 
 func normalizeRoots(inputs []string) []string {

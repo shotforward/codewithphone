@@ -1,7 +1,6 @@
 package app
 
 import (
-	"github.com/shotforward/codewithphone/internal/changeset"
 	"context"
 	"encoding/json"
 	"errors"
@@ -16,6 +15,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/shotforward/codewithphone/internal/changeset"
 	"github.com/shotforward/codewithphone/internal/config"
 )
 
@@ -52,24 +52,24 @@ type Service struct {
 	cfg         config.Config
 	interactive bool // true when running in foreground with a terminal
 
-	mu                sync.Mutex
-	actualAddr        string // resolved listen address (useful when port=0)
-	providerSessions  map[string]string
-	sessionWorkspaces map[string]string // sessionID -> first workspaceRoot
-	sessionLocks      map[string]*sync.Mutex // per-session lock for serial task execution
-	taskWorkspaces         map[string]string // taskRunID -> workspaceRoot
-	taskWorkspaceSnapshots map[string]string // taskRunID -> snapshot.Root for "vs turn start" diffs
+	mu                     sync.Mutex
+	actualAddr             string // resolved listen address (useful when port=0)
+	providerSessions       map[string]string
+	sessionWorkspaces      map[string]string      // sessionID -> first workspaceRoot
+	sessionLocks           map[string]*sync.Mutex // per-session lock for serial task execution
+	taskWorkspaces         map[string]string      // taskRunID -> workspaceRoot
+	taskWorkspaceSnapshots map[string]string      // taskRunID -> snapshot.Root for "vs turn start" diffs
 	taskProfiles           map[string]turnExecutionProfile
-	deniedApprovals   map[string]map[string]approvalStatus // taskRunID -> command fingerprint -> latest denied status
-	pendingSnapshots  map[string]*pendingChangeSet         // sessionID -> pending
-	allowedRoots      []string
-	capabilities      runtimeCapabilitiesPayload
-	serverClient      serverClient
-	codexRunner       turnRunner
-	geminiRunner      turnRunner
-	claudeRunner      turnRunner
-	changeSets        changeSetClient
-	pollInterval      time.Duration
+	deniedApprovals        map[string]map[string]approvalStatus // taskRunID -> command fingerprint -> latest denied status
+	pendingSnapshots       map[string]*pendingChangeSet         // sessionID -> pending
+	allowedRoots           []string
+	capabilities           runtimeCapabilitiesPayload
+	serverClient           serverClient
+	codexRunner            turnRunner
+	geminiRunner           turnRunner
+	claudeRunner           turnRunner
+	changeSets             changeSetClient
+	pollInterval           time.Duration
 
 	backgroundMu       sync.Mutex
 	backgroundCommands map[string]backgroundCommandRun
@@ -126,26 +126,26 @@ func New(cfg config.Config, opts ...Option) *Service {
 	}
 
 	svc := &Service{
-		cfg:               cfg,
-		interactive:       true, // default: foreground with terminal
-		providerSessions:  map[string]string{},
-		sessionWorkspaces: map[string]string{},
-		sessionLocks:      map[string]*sync.Mutex{},
+		cfg:                    cfg,
+		interactive:            true, // default: foreground with terminal
+		providerSessions:       map[string]string{},
+		sessionWorkspaces:      map[string]string{},
+		sessionLocks:           map[string]*sync.Mutex{},
 		taskWorkspaces:         map[string]string{},
 		taskWorkspaceSnapshots: map[string]string{},
 		taskProfiles:           map[string]turnExecutionProfile{},
-		deniedApprovals:   map[string]map[string]approvalStatus{},
-		pendingSnapshots:  map[string]*pendingChangeSet{},
-		capabilities:      defaultRuntimeCapabilities(cfg),
-		serverClient:      client,
+		deniedApprovals:        map[string]map[string]approvalStatus{},
+		pendingSnapshots:       map[string]*pendingChangeSet{},
+		capabilities:           defaultRuntimeCapabilities(cfg),
+		serverClient:           client,
 		changeSets: changeSetClient{
 			BaseURL:      cfg.ServerBaseURL,
 			HTTPClient:   client.httpClient(),
 			PollInterval: 500 * time.Millisecond,
 		},
-		pollInterval:          defaultPollInterval,
-		backgroundCommands:    map[string]backgroundCommandRun{},
-		runningCommands:       map[string]runningCommand{},
+		pollInterval:       defaultPollInterval,
+		backgroundCommands: map[string]backgroundCommandRun{},
+		runningCommands:    map[string]runningCommand{},
 	}
 	for _, opt := range opts {
 		opt(svc)
@@ -158,9 +158,19 @@ func New(cfg config.Config, opts ...Option) *Service {
 		}
 		return ""
 	}
-	svc.codexRunner = newCodexRunner(cfg, &svc.serverClient)
-	svc.geminiRunner = newGeminiRunner(cfg, &svc.serverClient, resolveBaseURL)
-	svc.claudeRunner = newClaudeRunner(cfg, &svc.serverClient, resolveBaseURL)
+	// onSelfUpdate is shared by every runner. When the CliUpdateBanner
+	// approves a self-update, the runner that handled the turn invokes
+	// this hook on its way out so the capability snapshot is re-probed
+	// within seconds (instead of waiting up to capabilityTicker ~10m).
+	// Run in a goroutine because RunTurn defers should not block on
+	// network I/O; refreshRuntimeCapabilities does its own context
+	// management and is safe under concurrent invocation.
+	onSelfUpdate := func() {
+		go svc.refreshRuntimeCapabilities(context.Background())
+	}
+	svc.codexRunner = newCodexRunner(cfg, &svc.serverClient, onSelfUpdate)
+	svc.geminiRunner = newGeminiRunner(cfg, &svc.serverClient, resolveBaseURL, onSelfUpdate)
+	svc.claudeRunner = newClaudeRunner(cfg, &svc.serverClient, resolveBaseURL, onSelfUpdate)
 	return svc
 }
 
@@ -186,17 +196,12 @@ func (s *Service) Run(ctx context.Context) error {
 	s.mu.Lock()
 	s.allowedRoots = append([]string(nil), allowedRoots...)
 	s.mu.Unlock()
-	workspaceRoot := ""
-	if len(allowedRoots) > 0 {
-		workspaceRoot = allowedRoots[0]
-	}
-	if workspaceRoot == "" {
-		workspaceRoot, _ = os.Getwd()
-	}
+	workspaceRoot := preferredWorkspaceRoot(allowedRoots)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", s.handleHealth)
 	mux.HandleFunc("GET /v1/runtime/state", s.handleRuntimeState)
+	mux.HandleFunc("POST /v2/group-sessions", s.handleCreateV2GroupSession)
 	mux.HandleFunc("POST /internal/mcp/tool_call", s.handleMCPToolCall)
 	mux.HandleFunc("POST /internal/file/touched", s.handleFileTouchedHook)
 	mux.HandleFunc("GET /mcp/sse", s.handleMCPSSE)
@@ -376,6 +381,9 @@ func (s *Service) getProviderSession(sessionID string) string {
 func (s *Service) getSessionLock(sessionID string) *sync.Mutex {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.sessionLocks == nil {
+		s.sessionLocks = map[string]*sync.Mutex{}
+	}
 	lock, ok := s.sessionLocks[sessionID]
 	if !ok {
 		lock = &sync.Mutex{}

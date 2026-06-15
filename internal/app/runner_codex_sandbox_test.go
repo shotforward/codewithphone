@@ -6,8 +6,11 @@ func TestThreadSandboxForProfile(t *testing.T) {
 	if got := threadSandboxForProfile(turnExecutionProfile{}); got != "workspace-write" {
 		t.Fatalf("expected non-read-only sandbox to be workspace-write, got %q", got)
 	}
-	if got := threadSandboxForProfile(turnExecutionProfile{ReadOnly: true}); got != "read-only" {
-		t.Fatalf("expected read-only sandbox to be read-only, got %q", got)
+	if got := threadSandboxForProfile(turnExecutionProfile{ReadOnly: true}); got != "workspace-write" {
+		t.Fatalf("expected daemon-only read-only profile to keep a reusable workspace thread, got %q", got)
+	}
+	if got := threadSandboxForProfile(turnExecutionProfile{ReadOnly: true, ThreadSandboxReadOnly: true}); got != "read-only" {
+		t.Fatalf("expected legacy thread read-only profile to use read-only sandbox, got %q", got)
 	}
 }
 

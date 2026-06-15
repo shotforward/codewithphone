@@ -19,12 +19,21 @@ type machineInventory struct {
 }
 
 type taskDispatch struct {
-	TaskRunID     string `json:"taskRunId"`
-	SessionID     string `json:"sessionId"`
-	Runtime       string `json:"runtime"`
-	Model         string `json:"model,omitempty"`
-	WorkspaceRoot string `json:"workspaceRoot"`
-	Prompt        string `json:"prompt"`
+	TaskRunID          string `json:"taskRunId"`
+	SessionID          string `json:"sessionId"`
+	TemplateID         string `json:"templateId,omitempty"`
+	AgentSessionID     string `json:"agentSessionId,omitempty"`
+	AgentID            string `json:"agentId,omitempty"`
+	AgentDisplayName   string `json:"agentDisplayName,omitempty"`
+	AgentMention       string `json:"agentMention,omitempty"`
+	RunSegmentID       string `json:"runSegmentId,omitempty"`
+	Mode               string `json:"mode,omitempty"`
+	ProviderSessionKey string `json:"providerSessionKey,omitempty"`
+	ProviderSessionRef string `json:"providerSessionRef,omitempty"`
+	Runtime            string `json:"runtime"`
+	Model              string `json:"model,omitempty"`
+	WorkspaceRoot      string `json:"workspaceRoot"`
+	Prompt             string `json:"prompt"`
 
 	// WorkspaceSnapshotRoot is the local path to the snapshot of the
 	// workspace taken at turn start. Used by file.touched emitters to

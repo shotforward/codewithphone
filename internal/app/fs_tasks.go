@@ -1,6 +1,7 @@
 package app
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -8,6 +9,7 @@ import (
 	"io/fs"
 	"log"
 	"os"
+	"os/exec"
 	"path"
 	"path/filepath"
 	"sort"
@@ -37,6 +39,21 @@ type daemonWorkspaceFileEntry struct {
 
 type daemonWorkspaceFileSearchResponse struct {
 	Items []daemonWorkspaceFileEntry `json:"items"`
+}
+
+type daemonRuntimeCLIUpdateRequest struct {
+	Runtime string `json:"runtime"`
+	Target  string `json:"target,omitempty"`
+}
+
+type daemonRuntimeCLIUpdateResponse struct {
+	OK      bool   `json:"ok"`
+	Runtime string `json:"runtime"`
+	Target  string `json:"target,omitempty"`
+	Version string `json:"version,omitempty"`
+	Stdout  string `json:"stdout,omitempty"`
+	Stderr  string `json:"stderr,omitempty"`
+	Error   string `json:"error,omitempty"`
 }
 
 type daemonWorkspaceFilePreviewResponse struct {
@@ -188,6 +205,16 @@ func (s *Service) handleFSTaskDispatch(ctx context.Context, dispatch fsTaskDispa
 			return s.serverClient.completeFSTask(ctx, dispatch.TaskID, "failed", "invalid terminate_command payload", nil)
 		}
 		response, err := s.executeTerminateCommand(dispatch.SessionID, req.CommandRunID, req.Reason)
+		if err != nil {
+			return s.serverClient.completeFSTask(ctx, dispatch.TaskID, "failed", err.Error(), nil)
+		}
+		return s.serverClient.completeFSTask(ctx, dispatch.TaskID, "completed", "", response)
+	case "runtime_cli_update":
+		var req daemonRuntimeCLIUpdateRequest
+		if err := json.Unmarshal(dispatch.RequestJSON, &req); err != nil {
+			return s.serverClient.completeFSTask(ctx, dispatch.TaskID, "failed", "invalid runtime_cli_update payload", nil)
+		}
+		response, err := s.executeRuntimeCLIUpdate(ctx, req)
 		if err != nil {
 			return s.serverClient.completeFSTask(ctx, dispatch.TaskID, "failed", err.Error(), nil)
 		}
@@ -353,6 +380,96 @@ func (s *Service) executeTerminateCommand(sessionID, commandRunID, _ string) (da
 		PID:          run.PID,
 		Status:       "terminated",
 	}, nil
+}
+
+func (s *Service) executeRuntimeCLIUpdate(ctx context.Context, req daemonRuntimeCLIUpdateRequest) (daemonRuntimeCLIUpdateResponse, error) {
+	runtimeName := strings.TrimSpace(req.Runtime)
+	target := strings.TrimSpace(req.Target)
+	if target == "" {
+		target = "latest"
+	}
+	response := daemonRuntimeCLIUpdateResponse{
+		Runtime: runtimeName,
+		Target:  target,
+	}
+	if target != "latest" {
+		response.Error = "target must be latest"
+		return response, nil
+	}
+
+	var installArgs []string
+	var verifyBin string
+	switch runtimeName {
+	case "codex_cli":
+		installArgs = []string{"install", "-g", "@openai/codex@latest"}
+		verifyBin = "codex"
+	case "gemini_cli":
+		installArgs = []string{"install", "-g", "@google/gemini-cli@latest"}
+		verifyBin = "gemini"
+	default:
+		response.Error = "unsupported runtime"
+		return response, nil
+	}
+
+	commandCtx, cancel := context.WithTimeout(ctx, 3*time.Minute)
+	defer cancel()
+	stdout, stderr, err := runRuntimeActionCommand(commandCtx, "npm", installArgs...)
+	response.Stdout = stdout
+	response.Stderr = stderr
+	if err != nil {
+		response.Error = err.Error()
+		return response, nil
+	}
+
+	versionCtx, versionCancel := context.WithTimeout(ctx, 20*time.Second)
+	defer versionCancel()
+	versionOut, versionErrOut, err := runRuntimeActionCommand(versionCtx, verifyBin, "--version")
+	if versionOut != "" {
+		response.Version = strings.TrimSpace(versionOut)
+	}
+	if versionErrOut != "" {
+		response.Stderr = joinCommandOutput(response.Stderr, versionErrOut)
+	}
+	if err != nil {
+		response.Error = err.Error()
+		return response, nil
+	}
+
+	response.OK = true
+	s.refreshRuntimeCapabilities(context.Background())
+	heartbeatCtx, heartbeatCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer heartbeatCancel()
+	hostname, _ := os.Hostname()
+	if err := s.serverClient.heartbeat(heartbeatCtx, machineInventory{
+		AllowedRoots: s.currentAllowedRoots(),
+		Projects:     discoverGitProjects(s.currentAllowedRoots(), 200),
+		Capabilities: s.getRuntimeCapabilities(),
+	}); err != nil {
+		log.Printf("runtime cli update heartbeat failed host=%s runtime=%s: %v", hostname, runtimeName, err)
+	}
+	return response, nil
+}
+
+func runRuntimeActionCommand(ctx context.Context, name string, args ...string) (string, string, error) {
+	cmd := exec.CommandContext(ctx, name, args...)
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	err := cmd.Run()
+	return strings.TrimSpace(stdout.String()), strings.TrimSpace(stderr.String()), err
+}
+
+func joinCommandOutput(left, right string) string {
+	left = strings.TrimSpace(left)
+	right = strings.TrimSpace(right)
+	if left == "" {
+		return right
+	}
+	if right == "" {
+		return left
+	}
+	return left + "\n" + right
 }
 
 func (s *Service) executeListFiles(workspaceRoot, query string, limit int) ([]daemonWorkspaceFileEntry, error) {

@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/shotforward/codewithphone/internal/changeset"
 )
 
 func TestBuildClaudeHookSettingsFromScratch(t *testing.T) {
@@ -181,5 +183,28 @@ func TestInstallClaudeWorkspaceHooksRemovesIfAbsent(t *testing.T) {
 
 	if _, err := os.Stat(settingsPath); !os.IsNotExist(err) {
 		t.Errorf("expected hook file to be removed after cleanup, got err=%v", err)
+	}
+}
+
+func TestClaudeHookCleanupBeforeChangeSetLeavesNoDiff(t *testing.T) {
+	workspace := t.TempDir()
+	snapshot, err := changeset.CreateSnapshot(workspace)
+	if err != nil {
+		t.Fatalf("CreateSnapshot: %v", err)
+	}
+	defer snapshot.Cleanup()
+
+	cleanup, err := installClaudeWorkspaceHooks(workspace)
+	if err != nil {
+		t.Fatalf("install: %v", err)
+	}
+	cleanup()
+
+	cs, err := changeset.BuildChangeSet("task_001", snapshot, workspace)
+	if err != nil {
+		t.Fatalf("BuildChangeSet: %v", err)
+	}
+	if cs != nil {
+		t.Fatalf("BuildChangeSet() = %+v, want nil after hook cleanup", cs)
 	}
 }

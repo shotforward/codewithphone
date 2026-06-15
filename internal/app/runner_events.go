@@ -1,8 +1,8 @@
 package app
 
 import (
-	"github.com/shotforward/codewithphone/internal/changeset"
 	"context"
+	"github.com/shotforward/codewithphone/internal/changeset"
 	"log"
 	"path/filepath"
 	"strings"
@@ -102,6 +102,37 @@ func emitToolCallFinished(ctx context.Context, server *serverClient, dispatch ta
 		EventType: "tool.call.finished",
 		Payload:   payload,
 	})
+}
+
+func emitAgentNotice(ctx context.Context, server *serverClient, dispatch taskDispatch, title, body, level string) error {
+	payload := map[string]any{
+		"body":  strings.TrimSpace(body),
+		"level": normalizeAgentNoticeLevel(level),
+	}
+	if strings.TrimSpace(title) != "" {
+		payload["title"] = strings.TrimSpace(title)
+	}
+	return server.postEvent(ctx, daemonEvent{
+		SessionID: dispatch.SessionID,
+		TaskRunID: dispatch.TaskRunID,
+		EventType: "agent.notice",
+		Payload:   payload,
+	})
+}
+
+func normalizeAgentNoticeLevel(level string) string {
+	switch strings.TrimSpace(strings.ToLower(level)) {
+	case "progress":
+		return "progress"
+	case "warning", "warn":
+		return "warning"
+	case "error", "danger":
+		return "error"
+	case "success":
+		return "success"
+	default:
+		return "info"
+	}
 }
 
 // fileTouchedDiffLimits hold the hard caps that protect storage and transport

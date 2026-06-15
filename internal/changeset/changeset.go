@@ -46,6 +46,7 @@ var generatedArtifactDirNames = map[string]bool{
 	"node_modules":    true,
 	".next":           true,
 	".cache":          true,
+	".gocache":        true,
 	"__pycache__":     true,
 	".venv":           true,
 	"venv":            true,

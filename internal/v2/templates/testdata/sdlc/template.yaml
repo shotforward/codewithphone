@@ -1,0 +1,63 @@
+schema_version: v2
+# New v2 official Template IDs use codewithphone/*; legacy PocketCode names
+# stay in existing code until a separate migration.
+id: codewithphone/sdlc
+version: 0.1.0
+display_name: SDLC Team
+description: User-directed software delivery agent group.
+interaction_model: agent_group
+metadata:
+  author: CodeWithPhone
+  license: Apache-2.0
+  tags:
+    - software-development
+    - agent-group
+orchestrator:
+  playbook: orchestrator/playbook.md
+agents:
+  - id: pm
+    display_name: Product Manager
+    mention: "@pm"
+    focus: Clarify requirements and maintain product artifacts.
+    prompt: agents/pm.md
+    skills:
+      - skills/requirements.md
+  - id: ux
+    display_name: UX Designer
+    mention: "@ux"
+    focus: Design user journeys, information architecture, and interaction flows.
+    prompt: agents/ux.md
+    skills:
+      - skills/ux.md
+  - id: architect
+    display_name: Architect
+    mention: "@architect"
+    focus: Define system boundaries, state machines, APIs, and data flow.
+    prompt: agents/architect.md
+    skills:
+      - skills/architecture.md
+  - id: developer
+    display_name: Developer
+    mention: "@developer"
+    focus: Implement scoped code changes after user direction.
+    prompt: agents/developer.md
+    skills:
+      - skills/implementation.md
+  - id: qa
+    display_name: QA
+    mention: "@qa"
+    focus: Verify behavior, tests, edge cases, and regression risk.
+    prompt: agents/qa.md
+    skills:
+      - skills/verification.md
+  - id: ops
+    display_name: Ops
+    mention: "@ops"
+    focus: Manage local/test deployments, production release operations, runtime health, logs, and rollback plans.
+    prompt: agents/ops.md
+    skills:
+      - skills/operations.md
+artifacts:
+  root: .codewithphone/sessions
+  markdown_first: true
+  max_markdown_bytes: 65536

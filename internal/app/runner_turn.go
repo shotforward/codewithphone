@@ -6,8 +6,10 @@ import (
 )
 
 type turnExecutionProfile struct {
-	ReadOnly     bool
-	TrackChanges bool
+	ReadOnly                   bool
+	TrackChanges               bool
+	ThreadSandboxReadOnly      bool
+	AppendReadOnlyInstructions bool
 	// BeforeComplete is invoked by each runner immediately before it emits
 	// the final turn.completed event. This lets the dispatch layer slip in
 	// side-effects (notably changeset.BuildChangeSet + changeset.generated emission)
@@ -33,15 +35,34 @@ func planTurnExecution(prompt string) turnExecutionProfile {
 	if normalized == "" {
 		return turnExecutionProfile{TrackChanges: true}
 	}
-	if isGreetingOnlyPrompt(normalized) {
-		return turnExecutionProfile{ReadOnly: true, TrackChanges: false}
+	if isCodeWithPhoneOrchestratorPrompt(normalized) {
+		return turnExecutionProfile{ReadOnly: true, TrackChanges: false, ThreadSandboxReadOnly: true}
+	}
+	planningText := strings.ToLower(executionPlanningText(prompt))
+	if isGreetingOnlyPrompt(planningText) {
+		return turnExecutionProfile{ReadOnly: true, TrackChanges: false, ThreadSandboxReadOnly: true, AppendReadOnlyInstructions: true}
 	}
 
-	if containsAny(normalized, "do not modify files", "without modifying files", "read-only", "readonly", "只读", "不要修改文件", "不修改文件") {
-		return turnExecutionProfile{ReadOnly: true, TrackChanges: false}
+	if containsAny(planningText, "do not modify files", "without modifying files", "read-only", "readonly", "只读", "不要修改文件", "不修改文件") {
+		return turnExecutionProfile{ReadOnly: true, TrackChanges: false, ThreadSandboxReadOnly: true, AppendReadOnlyInstructions: true}
 	}
 
 	return turnExecutionProfile{TrackChanges: true}
+}
+
+func isCodeWithPhoneOrchestratorPrompt(normalizedPrompt string) bool {
+	return strings.Contains(normalizedPrompt, "codewithphone orchestrator")
+}
+
+func planTurnExecutionForDispatch(dispatch taskDispatch) turnExecutionProfile {
+	switch strings.ToLower(strings.TrimSpace(dispatch.Mode)) {
+	case "discuss":
+		return turnExecutionProfile{ReadOnly: true, TrackChanges: false}
+	case "work":
+		return turnExecutionProfile{TrackChanges: true}
+	default:
+		return planTurnExecution(dispatch.Prompt)
+	}
 }
 
 func isGreetingOnlyPrompt(normalizedPrompt string) bool {
@@ -52,6 +73,19 @@ func isGreetingOnlyPrompt(normalizedPrompt string) bool {
 	default:
 		return false
 	}
+}
+
+func executionPlanningText(prompt string) string {
+	trimmed := strings.TrimSpace(prompt)
+	for _, marker := range []string{
+		"\nCURRENT USER MESSAGE:\n",
+		"\nUSER MESSAGE:\n",
+	} {
+		if idx := strings.LastIndex(trimmed, marker); idx >= 0 {
+			return strings.TrimSpace(trimmed[idx+len(marker):])
+		}
+	}
+	return trimmed
 }
 
 func containsAny(text string, needles ...string) bool {

@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -79,6 +80,15 @@ func (c approvalClient) waitForDecision(ctx context.Context, actionID string) (a
 		case <-ctx.Done():
 			if !timer.Stop() {
 				<-timer.C
+			}
+			if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+				return approvalStatus{
+					ID:             actionID,
+					Status:         "approved",
+					Decision:       "approve",
+					Scope:          "once",
+					DecisionReason: "approval_timeout_auto_approve",
+				}, nil
 			}
 			return approvalStatus{}, ctx.Err()
 		case <-timer.C:

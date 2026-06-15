@@ -31,7 +31,33 @@ func (s *Service) handleMCPToolCall(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if req.ToolName == "agent_notice" || req.ToolName == "pocketcode_agent_notice" {
+		s.handleAgentNoticeTool(w, r, req)
+		return
+	}
+
 	http.Error(w, "unsupported tool: "+req.ToolName, http.StatusBadRequest)
+}
+
+func (s *Service) handleAgentNoticeTool(w http.ResponseWriter, r *http.Request, req toolCallRequest) {
+	toolName := req.ToolName
+	if toolName == "" {
+		toolName = "agent_notice"
+	}
+	dispatch := taskDispatch{SessionID: req.SessionID, TaskRunID: req.TaskRunID}
+	toolCallID := fmt.Sprintf("tool_%d", time.Now().UnixNano())
+	startedAt := time.Now()
+	_ = emitToolCallStarted(r.Context(), &s.serverClient, dispatch, toolCallID, toolName, map[string]any{
+		"summary": truncateForLog(string(req.Arguments), 180),
+	})
+
+	result := s.executeAgentNoticeTool(r.Context(), req)
+	status := "success"
+	if resultIsError(result) {
+		status = "failed"
+	}
+	_ = emitToolCallFinished(r.Context(), &s.serverClient, dispatch, toolCallID, toolName, status, time.Since(startedAt), nil)
+	writeJSON(w, http.StatusOK, result)
 }
 
 func (s *Service) handleRunShellCommandTool(w http.ResponseWriter, r *http.Request, req toolCallRequest) {

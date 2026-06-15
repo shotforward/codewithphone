@@ -173,6 +173,7 @@ func TestApplySelectiveWorkspaceDecision(t *testing.T) {
 func TestFilterChangeSetFilesSkipsGeneratedArtifacts(t *testing.T) {
 	files := []File{
 		{Path: ".cache/go-build/abc123.tmp", Status: "modified", Diff: "cache diff"},
+		{Path: ".gocache/04/abc123-a", Status: "added", Diff: "go cache diff"},
 		{Path: "__pycache__/app.cpython-311.pyc", Status: "added", Diff: "pyc diff"},
 		{Path: "README.md", Status: "modified", Diff: "@@ -1 +1 @@\n-old\n+new\n"},
 	}

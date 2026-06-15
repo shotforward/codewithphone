@@ -1,0 +1,12 @@
+schema_version: v2
+# New v2 official Template IDs use codewithphone/*; legacy PocketCode names
+# stay in existing code until a separate migration.
+id: codewithphone/default
+version: 0.1.0
+display_name: Default Agent
+description: Preserve the current single-agent experience through a Template boundary.
+interaction_model: passthrough
+artifacts:
+  root: .codewithphone/sessions
+  markdown_first: true
+  max_markdown_bytes: 65536

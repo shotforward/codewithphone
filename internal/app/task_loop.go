@@ -2,8 +2,12 @@ package app
 
 import (
 	"context"
-	"log"
 	"errors"
+	"log"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -84,6 +88,16 @@ func (s *Service) handleCodexDispatch(ctx context.Context, dispatch taskDispatch
 	return s.handleRunnerDispatch(ctx, dispatch, s.codexRunner)
 }
 
+func dispatchProviderSessionKey(dispatch taskDispatch) string {
+	if providerSessionKey := strings.TrimSpace(dispatch.ProviderSessionKey); providerSessionKey != "" {
+		return providerSessionKey
+	}
+	if agentSessionID := strings.TrimSpace(dispatch.AgentSessionID); agentSessionID != "" {
+		return "agent:" + agentSessionID
+	}
+	return strings.TrimSpace(dispatch.SessionID)
+}
+
 func (s *Service) handleRunnerDispatch(ctx context.Context, dispatch taskDispatch, runner turnRunner) error {
 	// Serialize tasks for the same session: wait for any previous task
 	// (including a cancelled one being drained) to finish before starting.
@@ -92,7 +106,7 @@ func (s *Service) handleRunnerDispatch(ctx context.Context, dispatch taskDispatc
 	defer sessionLock.Unlock()
 
 	dispatchStart := time.Now()
-	profile := planTurnExecution(dispatch.Prompt)
+	profile := planTurnExecutionForDispatch(dispatch)
 	// Gemini session is directory-scoped; pin workspace before any task-scoped
 	// state (task workspace mapping, snapshots, and MCP file writes) is created.
 	if _, isGemini := runner.(*geminiRunner); isGemini {
@@ -146,6 +160,7 @@ func (s *Service) handleRunnerDispatch(ctx context.Context, dispatch taskDispatc
 			"mode": map[string]any{
 				"readOnly":     profile.ReadOnly,
 				"trackChanges": profile.TrackChanges,
+				"agentRunMode": strings.TrimSpace(dispatch.Mode),
 			},
 		},
 	}); err != nil {
@@ -186,6 +201,10 @@ func (s *Service) handleRunnerDispatch(ctx context.Context, dispatch taskDispatc
 		generatedCS *changeset.GeneratedChangeSet
 		csMu        sync.Mutex
 	)
+	isGeminiRunner := false
+	if _, ok := runner.(*geminiRunner); ok {
+		isGeminiRunner = true
+	}
 	if profile.TrackChanges {
 		t1 := time.Now()
 		snapshot, err = changeset.CreateSnapshot(dispatch.WorkspaceRoot)
@@ -202,6 +221,11 @@ func (s *Service) handleRunnerDispatch(ctx context.Context, dispatch taskDispatc
 		defer s.clearTaskWorkspaceSnapshot(dispatch.TaskRunID)
 		// NOTE: snapshot.Cleanup is NOT deferred here — ownership transfers
 		// to the background goroutine or is cleaned up immediately if no changeset.
+		var stopFileWatcher func()
+		if isGeminiRunner {
+			stopFileWatcher = s.startGeminiFileTouchedWatcher(taskCtx, dispatch)
+			defer stopFileWatcher()
+		}
 
 		// Install BeforeComplete hook so changeset.BuildChangeSet + changeset.generated
 		// are emitted BEFORE the runner's turn.completed — otherwise the
@@ -261,13 +285,17 @@ func (s *Service) handleRunnerDispatch(ctx context.Context, dispatch taskDispatc
 		}
 	}
 
-	providerSessionRef := s.getProviderSession(dispatch.SessionID)
+	providerSessionKey := dispatchProviderSessionKey(dispatch)
+	providerSessionRef := s.getProviderSession(providerSessionKey)
+	if strings.TrimSpace(providerSessionRef) == "" {
+		providerSessionRef = strings.TrimSpace(dispatch.ProviderSessionRef)
+	}
 	log.Printf("[TIMING] pre-RunTurn setup: %v", time.Since(dispatchStart))
 	t2 := time.Now()
 	nextRef, err := runner.RunTurn(taskCtx, dispatch, providerSessionRef, profile)
 	log.Printf("[TIMING] RunTurn: %v", time.Since(t2))
 	if nextRef != "" {
-		s.setProviderSession(dispatch.SessionID, nextRef)
+		s.setProviderSession(providerSessionKey, nextRef)
 	}
 	terminatedRequested := false
 	select {
@@ -340,6 +368,112 @@ func (s *Service) handleRunnerDispatch(ctx context.Context, dispatch taskDispatc
 	return nil
 }
 
+func (s *Service) startGeminiFileTouchedWatcher(ctx context.Context, dispatch taskDispatch) func() {
+	if strings.TrimSpace(dispatch.WorkspaceRoot) == "" || strings.TrimSpace(dispatch.WorkspaceSnapshotRoot) == "" {
+		return func() {}
+	}
+	watcherCtx, cancel := context.WithCancel(ctx)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		s.runGeminiFileTouchedWatcher(watcherCtx, dispatch)
+	}()
+	return func() {
+		cancel()
+		<-done
+	}
+}
+
+func (s *Service) runGeminiFileTouchedWatcher(ctx context.Context, dispatch taskDispatch) {
+	const interval = 900 * time.Millisecond
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	emitted := map[string]string{}
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			for path, kind := range scanWorkspaceChangedFiles(dispatch.WorkspaceSnapshotRoot, dispatch.WorkspaceRoot) {
+				key := path + "\x00" + kind
+				if emitted[key] != "" {
+					continue
+				}
+				emitted[key] = kind
+				emitCumulativeFileTouched(ctx, &s.serverClient, dispatch, path, kind, "gemini", "workspace-watcher")
+			}
+		}
+	}
+}
+
+func scanWorkspaceChangedFiles(snapshotRoot, workspaceRoot string) map[string]string {
+	before := collectWorkspaceFileFingerprints(snapshotRoot)
+	after := collectWorkspaceFileFingerprints(workspaceRoot)
+	changed := map[string]string{}
+	for path, prior := range before {
+		current, ok := after[path]
+		if !ok {
+			changed[path] = "deleted"
+			continue
+		}
+		if current != prior {
+			changed[path] = "modified"
+		}
+	}
+	for path := range after {
+		if _, ok := before[path]; !ok {
+			changed[path] = "added"
+		}
+	}
+	return changed
+}
+
+func collectWorkspaceFileFingerprints(root string) map[string]string {
+	files := map[string]string{}
+	if strings.TrimSpace(root) == "" {
+		return files
+	}
+	_ = filepath.WalkDir(root, func(path string, d os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return nil
+		}
+		rel, err := filepath.Rel(root, path)
+		if err != nil {
+			return nil
+		}
+		if rel == "." {
+			return nil
+		}
+		if d.IsDir() {
+			switch d.Name() {
+			case ".git", ".gemini-session", "node_modules", ".next", ".cache", "__pycache__", ".venv", "venv", "vendor", "dist", "build", ".turbo", "target", "go-build":
+				return filepath.SkipDir
+			default:
+				return nil
+			}
+		}
+		info, err := d.Info()
+		if err != nil || !info.Mode().IsRegular() {
+			return nil
+		}
+		normalized := filepath.ToSlash(rel)
+		switch strings.ToLower(filepath.Ext(normalized)) {
+		case ".pyc", ".pyo", ".class", ".o", ".a", ".so", ".dylib", ".exe", ".dll", ".log", ".tmp":
+			return nil
+		}
+		switch filepath.Base(normalized) {
+		case ".DS_Store", "Thumbs.db", "desktop.ini":
+			return nil
+		}
+		files[normalized] = info.ModTime().UTC().Format(time.RFC3339Nano) + ":" + info.Mode().String() + ":" + strconvFormatInt(info.Size())
+		return nil
+	})
+	return files
+}
+
+func strconvFormatInt(value int64) string {
+	return strconv.FormatInt(value, 10)
+}
 
 func (s *Service) watchSessionTermination(ctx context.Context, sessionID, taskRunID string, cancel context.CancelFunc, done <-chan struct{}, terminated chan struct{}) {
 	ticker := time.NewTicker(sessionTerminationPollInterval)

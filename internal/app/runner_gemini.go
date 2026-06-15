@@ -16,6 +16,7 @@ import (
 	"os/exec"
 	"os/user"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"syscall"
@@ -33,6 +34,10 @@ type geminiRunner struct {
 	resolveBaseURL func() string
 	server         *serverClient
 	approvals      approvalClient
+	// onSelfUpdate is invoked (in a fresh goroutine) after a turn whose
+	// prompt was produced by the CliUpdateBanner approve flow. Mirror of
+	// codexRunner.onSelfUpdate; see that struct for the full rationale.
+	onSelfUpdate func()
 }
 
 const (
@@ -128,7 +133,7 @@ func stderrTailLines(buf *stderrTailBuffer) []string {
 	return out
 }
 
-func newGeminiRunner(cfg config.Config, server *serverClient, resolveBaseURL func() string) *geminiRunner {
+func newGeminiRunner(cfg config.Config, server *serverClient, resolveBaseURL func() string, onSelfUpdate func()) *geminiRunner {
 	sessionRoot := filepath.Join(filepath.Dir(cfg.SQLitePath), "gemini-sessions")
 	return &geminiRunner{
 		geminiBin:      cfg.GeminiBin,
@@ -142,10 +147,18 @@ func newGeminiRunner(cfg config.Config, server *serverClient, resolveBaseURL fun
 			HTTPClient:   server.httpClient(),
 			PollInterval: 500 * time.Millisecond,
 		},
+		onSelfUpdate: onSelfUpdate,
 	}
 }
 
 func (r *geminiRunner) RunTurn(ctx context.Context, dispatch taskDispatch, providerSessionRef string, profile turnExecutionProfile) (string, error) {
+	// If this turn was triggered by the CliUpdateBanner approve flow,
+	// fire the self-update hook once the turn finishes (success or
+	// failure). See runner_codex.go for the full rationale.
+	if isSelfUpdateTurnPrompt(dispatch.Prompt) && r.onSelfUpdate != nil {
+		defer r.onSelfUpdate()
+	}
+
 	// deltaBuf MUST be a per-RunTurn local: the runner is a singleton shared
 	// across all concurrent task workers, so storing the buffer on the runner
 	// struct would let two sessions overwrite each other's session/task ids
@@ -196,6 +209,7 @@ deny_message = "No user interactive console is available. Use mcp_pocketcode_run
 			settings = map[string]any{}
 		}
 	}
+	disableGeminiTopicUpdateNarration(settings)
 
 	mcpServers, _ := settings["mcpServers"].(map[string]any)
 	if mcpServers == nil {
@@ -222,23 +236,12 @@ deny_message = "No user interactive console is available. Use mcp_pocketcode_run
 		return "", err
 	}
 
-	systemInstructions := `IMPORTANT TOOL USAGE RULES:
-- To execute shell commands, you MUST use the MCP tool "mcp_pocketcode_run_command". The built-in "run_shell_command" is disabled — do not attempt to use it.
-- To write or modify files, use the built-in "write_file" and "replace" tools. Prefer "replace" for targeted in-place edits and "write_file" only for new files or full rewrites. File changes are tracked automatically through the workspace snapshot — no extra reporting needed.
-- Use "read_file", "glob", and "search_file_content" freely for inspection.
-- Do NOT delegate shell command execution to sub-agents (e.g., generalist, codebase_investigator). Sub-agents cannot access MCP tools.
-- Always call tools yourself in the main agent context.
-- For long-running service commands (dev server, start/serve, docker compose up, watch, tail -f), call run_command with executionMode="auto" and waitTimeoutSec=120.
-
-`
-	prompt := systemInstructions + dispatch.Prompt
-	if profile.ReadOnly {
-		prompt += "\n\n(This is a read-only turn. Do not execute destructive commands.)"
-	}
+	prompt := buildGeminiPrompt(dispatch, profile)
 
 	args := []string{
 		"-p", prompt,
 		"--output-format", "stream-json",
+		"--skip-trust",
 	}
 	model := strings.TrimSpace(dispatch.Model)
 	if model == "" {
@@ -252,8 +255,13 @@ deny_message = "No user interactive console is available. Use mcp_pocketcode_run
 	} else {
 		args = append(args, "--approval-mode", "yolo", "--sandbox=false")
 	}
-	if providerSessionRef != "" {
-		args = append(args, "--resume", providerSessionRef)
+	resumeRef := strings.TrimSpace(providerSessionRef)
+	if resumeRef != "" && !geminiSessionRefExists(geminiHome, resumeRef) {
+		log.Printf("[GEMINI] provider session ref %q not found in %s; starting a fresh Gemini session", resumeRef, geminiHome)
+		resumeRef = ""
+	}
+	if resumeRef != "" {
+		args = append(args, "--resume", resumeRef)
 	}
 
 	cmd := exec.CommandContext(ctx, r.geminiBin, args...)
@@ -318,6 +326,8 @@ deny_message = "No user interactive console is available. Use mcp_pocketcode_run
 	currentAssistantItemID := ""
 	fallbackAssistantIndex := 0
 	geminiUnknownTypeLogged := map[string]bool{}
+	var assistantText strings.Builder
+	assistantCompleted := false
 
 	scanner := bufio.NewScanner(stdout)
 	scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
@@ -338,7 +348,7 @@ deny_message = "No user interactive console is available. Use mcp_pocketcode_run
 			if sid, ok := raw["session_id"].(string); ok && strings.TrimSpace(sid) != "" {
 				sessionID = sid
 			}
-		case eventType == "message" && strings.EqualFold(strings.TrimSpace(stringValue(raw["role"])), "assistant"):
+		case eventType == "message" && isGeminiAssistantMessage(raw):
 			text := extractGeminiAssistantText(raw)
 			if strings.TrimSpace(text) == "" {
 				continue
@@ -360,8 +370,10 @@ deny_message = "No user interactive console is available. Use mcp_pocketcode_run
 				streamOpen = true
 			}
 			if boolValue(raw["delta"]) {
+				assistantText.WriteString(text)
 				deltaBuf.Append(ctx, text, itemID)
 			} else {
+				assistantText.WriteString(text)
 				deltaBuf.Flush(ctx)
 				if err := r.server.postEvent(ctx, daemonEvent{
 					SessionID: dispatch.SessionID,
@@ -374,6 +386,7 @@ deny_message = "No user interactive console is available. Use mcp_pocketcode_run
 				}); err != nil {
 					log.Printf("gemini postEvent assistant.message.completed error: %v", err)
 				}
+				assistantCompleted = true
 			}
 		case eventType == "result":
 			if status := strings.TrimSpace(strings.ToLower(stringValue(raw["status"]))); status != "" && status != "success" {
@@ -381,6 +394,9 @@ deny_message = "No user interactive console is available. Use mcp_pocketcode_run
 				continue
 			}
 			text := extractGeminiResultText(raw)
+			if strings.TrimSpace(text) == "" {
+				text = assistantText.String()
+			}
 			if strings.TrimSpace(text) == "" {
 				text = geminiNoTextFallback
 			}
@@ -394,16 +410,20 @@ deny_message = "No user interactive console is available. Use mcp_pocketcode_run
 				fallbackAssistantIndex++
 				itemID = fmt.Sprintf("%s:assistant:%d", dispatch.TaskRunID, fallbackAssistantIndex)
 			}
-			if err := r.server.postEvent(ctx, daemonEvent{
-				SessionID: dispatch.SessionID,
-				TaskRunID: dispatch.TaskRunID,
-				EventType: "assistant.message.completed",
-				Payload: map[string]any{
-					"itemId": itemID,
-					"text":   text,
-				},
-			}); err != nil {
-				log.Printf("gemini postEvent assistant.message.completed fallback error: %v", err)
+			deltaBuf.Flush(ctx)
+			if !assistantCompleted {
+				if err := r.server.postEvent(ctx, daemonEvent{
+					SessionID: dispatch.SessionID,
+					TaskRunID: dispatch.TaskRunID,
+					EventType: "assistant.message.completed",
+					Payload: map[string]any{
+						"itemId": itemID,
+						"text":   text,
+					},
+				}); err != nil {
+					log.Printf("gemini postEvent assistant.message.completed fallback error: %v", err)
+				}
+				assistantCompleted = true
 			}
 		default:
 			// Defensive: log unrecognized event types so future Gemini CLI
@@ -411,7 +431,16 @@ deny_message = "No user interactive console is available. Use mcp_pocketcode_run
 			// dropped. Logged at most once per type per turn.
 			if !geminiUnknownTypeLogged[eventType] {
 				geminiUnknownTypeLogged[eventType] = true
-				log.Printf("[GEMINI] unhandled stream event type=%q (taskRun=%s)", eventType, dispatch.TaskRunID)
+				switch eventType {
+				case "message":
+					log.Printf("[GEMINI] unhandled stream event type=%q shape=%s (taskRun=%s)", eventType, describeGeminiMessageShape(raw), dispatch.TaskRunID)
+				case "tool_use":
+					log.Printf("[GEMINI] unhandled stream event type=%q shape=%s (taskRun=%s)", eventType, describeGeminiToolUseShape(raw), dispatch.TaskRunID)
+				case "tool_result":
+					log.Printf("[GEMINI] unhandled stream event type=%q shape=%s (taskRun=%s)", eventType, describeGeminiToolResultShape(raw), dispatch.TaskRunID)
+				default:
+					log.Printf("[GEMINI] unhandled stream event type=%q keys=%s (taskRun=%s)", eventType, strings.Join(sortedMapKeys(raw), ","), dispatch.TaskRunID)
+				}
 			}
 		}
 	}
@@ -442,13 +471,18 @@ deny_message = "No user interactive console is available. Use mcp_pocketcode_run
 	if err := profile.RunBeforeComplete(ctx); err != nil {
 		log.Printf("[CHANGESET] gemini runner beforeComplete hook failed: %v", err)
 	}
+	completedPayload := map[string]any{
+		"status": "completed",
+	}
+	if strings.TrimSpace(sessionID) != "" {
+		completedPayload["providerSessionRef"] = strings.TrimSpace(sessionID)
+		completedPayload["sessionId"] = strings.TrimSpace(sessionID)
+	}
 	_ = r.server.postEvent(ctx, daemonEvent{
 		SessionID: dispatch.SessionID,
 		TaskRunID: dispatch.TaskRunID,
 		EventType: "turn.completed",
-		Payload: map[string]any{
-			"status": "completed",
-		},
+		Payload:   completedPayload,
 	})
 
 	return sessionID, nil
@@ -472,11 +506,152 @@ func boolValue(value any) bool {
 	}
 }
 
+func buildGeminiPrompt(dispatch taskDispatch, profile turnExecutionProfile) string {
+	runtimeInstructions := `IMPORTANT TOOL USAGE RULES:
+- To execute shell commands, you MUST use the MCP tool "mcp_pocketcode_run_command". The built-in "run_shell_command" is disabled — do not attempt to use it.
+- To write or modify files, use the built-in "write_file" and "replace" tools. Prefer "replace" for targeted in-place edits and "write_file" only for new files or full rewrites. File changes are tracked automatically through the workspace snapshot — no extra reporting needed.
+- Use "read_file", "glob", and "search_file_content" freely for inspection.
+- Do NOT delegate shell command execution to sub-agents (e.g., generalist, codebase_investigator). Sub-agents cannot access MCP tools.
+- Always call tools yourself in the main agent context.
+- For long-running service commands (dev server, start/serve, docker compose up, watch, tail -f), call run_command with executionMode="auto" and waitTimeoutSec=120.
+
+	`
+	prompt := appendInstructionBlocks(runtimeInstructions, agentRoleInstructions(dispatch), "CURRENT USER MESSAGE:\n"+dispatch.Prompt)
+	if profile.AppendReadOnlyInstructions {
+		prompt += "\n\n(This is a read-only turn. Do not execute destructive commands.)"
+	}
+	return prompt
+}
+
+func disableGeminiTopicUpdateNarration(settings map[string]any) {
+	general, _ := settings["general"].(map[string]any)
+	if general == nil {
+		general = map[string]any{}
+	}
+	general["topicUpdateNarration"] = false
+	settings["general"] = general
+
+	experimental, _ := settings["experimental"].(map[string]any)
+	if experimental == nil {
+		experimental = map[string]any{}
+	}
+	experimental["topicUpdateNarration"] = false
+	settings["experimental"] = experimental
+}
+
+func describeGeminiMessageShape(raw map[string]any) string {
+	message, _ := raw["message"].(map[string]any)
+	return fmt.Sprintf("role=%q messageType=%q delta=%t keys=%s content=%s text=%s message=%s messageKeys=%s messageContent=%s messageText=%s",
+		geminiMessageRole(raw),
+		stringValue(raw["messageType"]),
+		boolValue(raw["delta"]),
+		strings.Join(sortedMapKeys(raw), ","),
+		geminiValueShape(raw["content"]),
+		geminiValueShape(raw["text"]),
+		geminiValueShape(raw["message"]),
+		strings.Join(sortedMapKeys(message), ","),
+		geminiValueShape(message["content"]),
+		geminiValueShape(message["text"]),
+	)
+}
+
+func describeGeminiToolUseShape(raw map[string]any) string {
+	return fmt.Sprintf("tool=%q id=%q keys=%s parameters=%s",
+		firstNonEmptyGeminiString(raw, "tool_name", "toolName", "name"),
+		firstNonEmptyGeminiString(raw, "tool_id", "toolId", "id"),
+		strings.Join(sortedMapKeys(raw), ","),
+		geminiValueShape(raw["parameters"]),
+	)
+}
+
+func describeGeminiToolResultShape(raw map[string]any) string {
+	return fmt.Sprintf("id=%q status=%q keys=%s output=%s error=%s",
+		firstNonEmptyGeminiString(raw, "tool_id", "toolId", "id"),
+		stringValue(raw["status"]),
+		strings.Join(sortedMapKeys(raw), ","),
+		geminiValueShape(raw["output"]),
+		geminiValueShape(raw["error"]),
+	)
+}
+
+func firstNonEmptyGeminiString(values map[string]any, keys ...string) string {
+	for _, key := range keys {
+		if value := strings.TrimSpace(stringValue(values[key])); value != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func sortedMapKeys(values map[string]any) []string {
+	if len(values) == 0 {
+		return nil
+	}
+	keys := make([]string, 0, len(values))
+	for key := range values {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+func geminiValueShape(value any) string {
+	switch typed := value.(type) {
+	case nil:
+		return "nil"
+	case string:
+		return fmt.Sprintf("string(len=%d)", len(typed))
+	case []any:
+		return fmt.Sprintf("array(len=%d)", len(typed))
+	case map[string]any:
+		return "object(keys=" + strings.Join(sortedMapKeys(typed), ",") + ")"
+	default:
+		return fmt.Sprintf("%T", value)
+	}
+}
+
+func geminiMessageRole(raw map[string]any) string {
+	if role := strings.TrimSpace(stringValue(raw["role"])); role != "" {
+		return role
+	}
+	message, _ := raw["message"].(map[string]any)
+	return strings.TrimSpace(stringValue(message["role"]))
+}
+
+func isGeminiAssistantMessage(raw map[string]any) bool {
+	role := strings.ToLower(strings.TrimSpace(geminiMessageRole(raw)))
+	if role == "user" {
+		return false
+	}
+	if isGeminiAssistantRole(role) {
+		return true
+	}
+
+	messageType := strings.ToLower(strings.TrimSpace(stringValue(raw["messageType"])))
+	if messageType == "" {
+		message, _ := raw["message"].(map[string]any)
+		messageType = strings.ToLower(strings.TrimSpace(stringValue(message["messageType"])))
+	}
+	if messageType == "info" || messageType == "error" || messageType == "warning" {
+		return false
+	}
+
+	return boolValue(raw["delta"]) && strings.TrimSpace(extractGeminiAssistantText(raw)) != ""
+}
+
+func isGeminiAssistantRole(role string) bool {
+	role = strings.ToLower(strings.TrimSpace(role))
+	return role == "assistant" || role == "model" || role == "agent"
+}
+
 func extractGeminiAssistantText(raw map[string]any) string {
 	if text := collectGeminiText(raw["content"]); strings.TrimSpace(text) != "" {
 		return text
 	}
 	if text := collectGeminiText(raw["text"]); strings.TrimSpace(text) != "" {
+		return text
+	}
+	if text := collectGeminiText(raw["message"]); strings.TrimSpace(text) != "" {
 		return text
 	}
 	message, _ := raw["message"].(map[string]any)
@@ -575,9 +750,29 @@ var syncSkipDirs = map[string]bool{
 	"policies": true, // we write our own policies
 }
 
+// syncAllowedGeminiFiles is intentionally narrow. The per-session Gemini home
+// only needs auth and user settings; copying memory/project files such as
+// GEMINI.md or projects.json leaks unrelated repository context into new
+// CodeWithPhone agent sessions.
+var syncAllowedGeminiFiles = map[string]bool{
+	"settings.json":           true,
+	"gemini-credentials.json": true,
+	"google_accounts.json":    true,
+}
+
+var syncRemovedGeminiFiles = []string{
+	"GEMINI.md",
+	"trustedFolders.json",
+}
+
 func syncGeminiConfig(srcDir, dstDir string) error {
 	if err := os.MkdirAll(dstDir, 0o755); err != nil {
 		return fmt.Errorf("prepare gemini config dir: %w", err)
+	}
+	for _, name := range syncRemovedGeminiFiles {
+		if err := os.Remove(filepath.Join(dstDir, name)); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("remove stale gemini config %s: %w", name, err)
+		}
 	}
 
 	info, err := os.Stat(srcDir)
@@ -620,6 +815,9 @@ func syncGeminiConfig(srcDir, dstDir string) error {
 		if !srcInfo.Mode().IsRegular() {
 			return nil
 		}
+		if !shouldSyncGeminiConfigFile(rel) {
+			return nil
+		}
 
 		// Skip if target is already up-to-date (same size and mod time)
 		if dstInfo, dstErr := os.Stat(target); dstErr == nil {
@@ -630,6 +828,58 @@ func syncGeminiConfig(srcDir, dstDir string) error {
 
 		return copyRegularFile(path, target, srcInfo.Mode().Perm())
 	})
+}
+
+func shouldSyncGeminiConfigFile(rel string) bool {
+	clean := filepath.Clean(rel)
+	if clean == "." || clean == "" {
+		return false
+	}
+	if filepath.Base(clean) != clean {
+		return false
+	}
+	return syncAllowedGeminiFiles[clean]
+}
+
+func geminiSessionRefExists(geminiHome, providerSessionRef string) bool {
+	ref := strings.TrimSpace(providerSessionRef)
+	if ref == "" {
+		return false
+	}
+	roots := []string{
+		filepath.Join(geminiHome, ".gemini", "tmp"),
+		filepath.Join(geminiHome, ".gemini", "history"),
+	}
+	for _, root := range roots {
+		found := false
+		_ = filepath.WalkDir(root, func(path string, d fs.DirEntry, walkErr error) error {
+			if walkErr != nil {
+				return nil
+			}
+			if d.IsDir() {
+				return nil
+			}
+			name := d.Name()
+			if !strings.HasSuffix(name, ".jsonl") && !strings.HasSuffix(name, ".json") {
+				return nil
+			}
+			file, err := os.Open(path)
+			if err != nil {
+				return nil
+			}
+			defer file.Close()
+			payload, err := io.ReadAll(io.LimitReader(file, 64*1024))
+			if err == nil && strings.Contains(string(payload), ref) {
+				found = true
+				return fs.SkipAll
+			}
+			return nil
+		})
+		if found {
+			return true
+		}
+	}
+	return false
 }
 
 func copyRegularFile(srcPath, dstPath string, perm fs.FileMode) error {

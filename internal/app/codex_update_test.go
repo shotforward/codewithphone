@@ -2,7 +2,6 @@ package app
 
 import (
 	"context"
-	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -17,20 +16,8 @@ func withCodexRegistryURL(t *testing.T, url string) {
 	t.Cleanup(func() { codexNpmRegistryURL = original })
 }
 
-// fakeNpmRegistry returns an httptest.Server that responds to the latest
-// metadata endpoint with the supplied version. If status is non-zero it
-// short-circuits with that HTTP status and an empty body.
-func fakeNpmRegistry(t *testing.T, version string, status int) *httptest.Server {
-	t.Helper()
-	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if status != 0 {
-			w.WriteHeader(status)
-			return
-		}
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]string{"version": version})
-	}))
-}
+// fakeNpmRegistry lives in runtime_update_helpers_test.go — shared with
+// gemini_update_test.go so the two never drift.
 
 func TestCheckCodexUpdateReportsAvailableWhenNewer(t *testing.T) {
 	srv := fakeNpmRegistry(t, "0.120.0", 0)

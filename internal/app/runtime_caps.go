@@ -55,6 +55,20 @@ var codexNpmRegistryURL = "https://registry.npmjs.org/@openai/codex/latest"
 const codexNpmPackage = "@openai/codex"
 const codexUpdateCommand = "npm install -g @openai/codex@latest"
 
+// gemini* mirror the codex* update-detection constants above. Each CLI
+// keeps its own dedicated symbols on purpose: the npm fetch/compare logic
+// looks duplicated but the runtimes evolve independently (different release
+// cadences, different package metadata edge cases), and a shared abstraction
+// would force every future per-CLI quirk through a generic seam.
+//
+// claude_code_cli is intentionally NOT included here: the Claude Code CLI
+// ships its own background auto-updater, so a daemon-side banner would race
+// with Claude's own update cycle. Revisit if upstream changes that.
+var geminiNpmRegistryURL = "https://registry.npmjs.org/@google/gemini-cli/latest"
+
+const geminiNpmPackage = "@google/gemini-cli"
+const geminiUpdateCommand = "npm install -g @google/gemini-cli@latest"
+
 // ---------------------------------------------------------------------------
 // Known model tables & fallbacks
 // ---------------------------------------------------------------------------
@@ -75,13 +89,13 @@ var codexFallbackModels = []string{
 }
 
 var geminiFallbackModels = []string{
+	"gemini-2.5-flash",
+	"gemini-2.5-pro",
+	"gemini-2.5-flash-lite",
+	"gemini-2.0-flash",
 	"gemini-3-pro-preview",
 	"gemini-3-flash-preview",
 	"gemini-3.1-pro-preview",
-	"gemini-2.5-pro",
-	"gemini-2.5-flash",
-	"gemini-2.5-flash-lite",
-	"gemini-2.0-flash",
 }
 
 // geminiModelConstantPattern matches JS constant assignments like:
@@ -100,7 +114,7 @@ var geminiModelConstantPattern = regexp.MustCompile(
 func defaultRuntimeCapabilities(cfg config.Config) runtimeCapabilitiesPayload {
 	geminiDefault := strings.TrimSpace(cfg.GeminiModel)
 	if geminiDefault == "" {
-		geminiDefault = "gemini-3-flash-preview"
+		geminiDefault = "gemini-2.5-flash"
 	}
 	claudeDefault := strings.TrimSpace(cfg.ClaudeModel)
 	if claudeDefault == "" {
@@ -168,11 +182,36 @@ func normalizeRuntimeCapability(cap runtimeCapabilityPayload) runtimeCapabilityP
 	if cap.DefaultModel == "" && len(models) > 0 {
 		cap.DefaultModel = models[0]
 	}
+	if cap.DefaultModel != "" && len(models) > 1 {
+		models = moveModelToFront(models, cap.DefaultModel)
+	}
 	if len(models) == 0 {
 		cap.Discoverable = false
 	}
 	cap.Models = models
 	return cap
+}
+
+func moveModelToFront(models []string, target string) []string {
+	target = strings.TrimSpace(target)
+	if target == "" || len(models) < 2 {
+		return models
+	}
+	index := -1
+	for i, model := range models {
+		if model == target {
+			index = i
+			break
+		}
+	}
+	if index <= 0 {
+		return models
+	}
+	out := make([]string, 0, len(models))
+	out = append(out, models[index])
+	out = append(out, models[:index]...)
+	out = append(out, models[index+1:]...)
+	return out
 }
 
 func normalizeRuntimeCapabilities(in runtimeCapabilitiesPayload) runtimeCapabilitiesPayload {
@@ -484,6 +523,74 @@ func checkCodexUpdate(ctx context.Context, installedRaw string) (latest string, 
 }
 
 // ---------------------------------------------------------------------------
+// Gemini CLI update detection
+// ---------------------------------------------------------------------------
+//
+// Mirrors the Codex update-detection block above. Kept as a separate
+// implementation (rather than a shared helper) so per-runtime quirks can
+// evolve independently — see the comment near geminiNpmRegistryURL.
+
+// fetchGeminiLatestVersion queries the npm registry for the latest
+// published version of @google/gemini-cli. Best-effort: returns ("", err)
+// on any failure. Mirror of fetchCodexLatestVersion.
+func fetchGeminiLatestVersion(ctx context.Context) (string, error) {
+	reqCtx, cancel := context.WithTimeout(ctx, httpProbeTimeout)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, geminiNpmRegistryURL, nil)
+	if err != nil {
+		return "", fmt.Errorf("build registry request: %w", err)
+	}
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("User-Agent", "pocketcode-daemon/runtime-caps")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("npm registry request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return "", fmt.Errorf("npm registry status %d", resp.StatusCode)
+	}
+
+	var payload struct {
+		Version string `json:"version"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		return "", fmt.Errorf("decode registry payload: %w", err)
+	}
+	version := strings.TrimSpace(payload.Version)
+	if version == "" {
+		return "", errors.New("npm registry returned empty version")
+	}
+	return version, nil
+}
+
+// checkGeminiUpdate compares the installed Gemini CLI version against the
+// latest published on npm. Mirror of checkCodexUpdate; see that function
+// for the rationale behind each branch.
+func checkGeminiUpdate(ctx context.Context, installedRaw string) (latest string, updateAvailable bool, updateCommand string) {
+	if strings.TrimSpace(installedRaw) == "" {
+		return "", false, ""
+	}
+	latestRaw, err := fetchGeminiLatestVersion(ctx)
+	if err != nil {
+		log.Printf("[capabilities] gemini update check skipped: %v", err)
+		return "", false, ""
+	}
+	installed := extractVersionNumber(installedRaw)
+	parts := strings.Split(installed, ".")
+	if installed == "" || len(parts) < 2 || !isDigits(parts[0]) {
+		return latestRaw, false, ""
+	}
+	if compareVersions(installed, latestRaw) < 0 {
+		return latestRaw, true, geminiUpdateCommand
+	}
+	return latestRaw, false, ""
+}
+
+// ---------------------------------------------------------------------------
 // Strategy: Gemini – static known models
 // ---------------------------------------------------------------------------
 //
@@ -513,6 +620,13 @@ func extractGeminiModelsFromBundle(geminiBin string) ([]string, error) {
 	bin := strings.TrimSpace(geminiBin)
 	if bin == "" {
 		return nil, errors.New("gemini binary path is empty")
+	}
+	if !strings.ContainsRune(bin, filepath.Separator) {
+		resolved, err := exec.LookPath(bin)
+		if err != nil {
+			return nil, fmt.Errorf("look up gemini binary: %w", err)
+		}
+		bin = resolved
 	}
 	realPath, err := filepath.EvalSymlinks(bin)
 	if err != nil {
@@ -619,9 +733,16 @@ func detectRuntimeCapabilities(ctx context.Context, cfg config.Config) runtimeCa
 		// Per-runtime update detection. Best-effort and decoupled from model
 		// discovery: the daemon never auto-updates a CLI, it just surfaces an
 		// "update available" hint so the UI can prompt the user.
+		//
+		// claude_code_cli intentionally omitted: Claude CLI ships its own
+		// background auto-updater, so a banner here would be redundant and
+		// could race with Claude's own update cycle. Revisit if upstream
+		// changes that behaviour.
 		switch cap.Runtime {
 		case "codex_cli":
 			cap.LatestCLIVersion, cap.UpdateAvailable, cap.UpdateCommand = checkCodexUpdate(ctx, cap.CLIVersion)
+		case "gemini_cli":
+			cap.LatestCLIVersion, cap.UpdateAvailable, cap.UpdateCommand = checkGeminiUpdate(ctx, cap.CLIVersion)
 		}
 
 		out.Runtimes = append(out.Runtimes, normalizeRuntimeCapability(cap))

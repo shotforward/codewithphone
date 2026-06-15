@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"log"
 	"strings"
 	"sync"
 	"time"
@@ -16,6 +17,7 @@ type EventBuffer struct {
 	itemID    string
 	timer     *time.Timer
 	closed    bool
+	lastErr   error
 }
 
 func NewEventBuffer(server *serverClient, sessionID, taskRunID string) *EventBuffer {
@@ -91,7 +93,7 @@ func (eb *EventBuffer) doFlush() {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	_ = eb.server.postEvent(ctx, daemonEvent{
+	if err := eb.server.postEvent(ctx, daemonEvent{
 		SessionID: eb.sessionID,
 		TaskRunID: eb.taskRunID,
 		EventType: "assistant.delta",
@@ -99,7 +101,18 @@ func (eb *EventBuffer) doFlush() {
 			"itemId": chooseNonEmpty(itemID, eb.taskRunID),
 			"delta":  text,
 		},
-	})
+	}); err != nil {
+		log.Printf("assistant.delta postEvent failed: taskRun=%s err=%v", eb.taskRunID, err)
+		eb.mu.Lock()
+		eb.lastErr = err
+		eb.mu.Unlock()
+	}
+}
+
+func (eb *EventBuffer) LastError() error {
+	eb.mu.Lock()
+	defer eb.mu.Unlock()
+	return eb.lastErr
 }
 
 func chooseNonEmpty(values ...string) string {

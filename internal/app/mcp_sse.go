@@ -249,6 +249,22 @@ func mcpToolsList() []map[string]any {
 				},
 			},
 		},
+		{
+			"name":        "agent_notice",
+			"description": "Send a short progress, warning, or handoff notice to the user-visible group timeline.",
+			"inputSchema": map[string]any{
+				"type":     "object",
+				"required": []string{"body"},
+				"properties": map[string]any{
+					"body":  map[string]any{"type": "string", "description": "Short notice text for the user or group."},
+					"title": map[string]any{"type": "string"},
+					"level": map[string]any{
+						"type": "string",
+						"enum": []string{"info", "progress", "warning", "error", "success"},
+					},
+				},
+			},
+		},
 	}
 }
 
@@ -267,9 +283,58 @@ func (s *Service) executeMCPToolCall(ctx context.Context, sessionID, taskRunID s
 	if tcReq.ToolName == "run_command" || tcReq.ToolName == "pocketcode_run_command" {
 		return s.executeRunCommandTool(ctx, tcReq)
 	}
+	if tcReq.ToolName == "agent_notice" || tcReq.ToolName == "pocketcode_agent_notice" {
+		return s.executeAgentNoticeTool(ctx, tcReq)
+	}
 	return map[string]any{
 		"content": []map[string]any{{"type": "text", "text": "unsupported tool: " + tcReq.ToolName}},
 		"isError": true,
+	}
+}
+
+type agentNoticeToolArgs struct {
+	Body  string `json:"body"`
+	Title string `json:"title"`
+	Level string `json:"level"`
+}
+
+const maxAgentNoticeBodyRunes = 4000
+
+func parseAgentNoticeToolArgs(raw json.RawMessage) (agentNoticeToolArgs, error) {
+	var args agentNoticeToolArgs
+	if err := json.Unmarshal(raw, &args); err != nil {
+		return agentNoticeToolArgs{}, err
+	}
+	args.Body = strings.TrimSpace(args.Body)
+	args.Title = strings.TrimSpace(args.Title)
+	args.Level = normalizeAgentNoticeLevel(args.Level)
+	if args.Body == "" {
+		return agentNoticeToolArgs{}, fmt.Errorf("body is required")
+	}
+	bodyRunes := []rune(args.Body)
+	if len(bodyRunes) > maxAgentNoticeBodyRunes {
+		args.Body = string(bodyRunes[:maxAgentNoticeBodyRunes])
+	}
+	return args, nil
+}
+
+func (s *Service) executeAgentNoticeTool(ctx context.Context, req toolCallRequest) map[string]any {
+	args, err := parseAgentNoticeToolArgs(req.Arguments)
+	if err != nil {
+		return map[string]any{
+			"content": []map[string]any{{"type": "text", "text": "invalid arguments: " + err.Error()}},
+			"isError": true,
+		}
+	}
+	dispatch := taskDispatch{SessionID: req.SessionID, TaskRunID: req.TaskRunID}
+	if err := emitAgentNotice(ctx, &s.serverClient, dispatch, args.Title, args.Body, args.Level); err != nil {
+		return map[string]any{
+			"content": []map[string]any{{"type": "text", "text": "failed to send notice: " + err.Error()}},
+			"isError": true,
+		}
+	}
+	return map[string]any{
+		"content": []map[string]any{{"type": "text", "text": "notice sent"}},
 	}
 }
 

@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -23,6 +24,13 @@ type claudeRunner struct {
 	resolveBaseURL func() string
 	server         *serverClient
 	approvals      approvalClient
+	// onSelfUpdate mirrors codexRunner.onSelfUpdate. The Claude CLI ships
+	// its own background auto-updater (so checkClaudeUpdate is intentionally
+	// absent from runtime_caps.go), but the hook is wired here defensively:
+	// if a user manually pastes a self-update prompt into a Claude session,
+	// or if we ever enable banner-driven updates for Claude, the daemon
+	// will already do the right thing without further runner changes.
+	onSelfUpdate func()
 }
 
 // claudeStreamEvent covers the stream-json events emitted by Claude Code CLI.
@@ -67,18 +75,18 @@ type claudeBlock struct {
 // `{"type":"stream_event","event":{...}}` envelope when
 // --include-partial-messages is enabled.
 type claudeRawStreamEvent struct {
-	Type  string           `json:"type"`            // message_start / content_block_delta / message_stop / ...
-	Index int              `json:"index,omitempty"` // content block index
-	Delta *claudeRawDelta  `json:"delta,omitempty"`
+	Type  string          `json:"type"`            // message_start / content_block_delta / message_stop / ...
+	Index int             `json:"index,omitempty"` // content block index
+	Delta *claudeRawDelta `json:"delta,omitempty"`
 }
 
 type claudeRawDelta struct {
-	Type        string `json:"type"`                  // text_delta / input_json_delta / ...
+	Type        string `json:"type"` // text_delta / input_json_delta / ...
 	Text        string `json:"text,omitempty"`
 	PartialJSON string `json:"partial_json,omitempty"`
 }
 
-func newClaudeRunner(cfg config.Config, server *serverClient, resolveBaseURL func() string) *claudeRunner {
+func newClaudeRunner(cfg config.Config, server *serverClient, resolveBaseURL func() string, onSelfUpdate func()) *claudeRunner {
 	return &claudeRunner{
 		claudeBin:      cfg.ClaudeBin,
 		claudeModel:    cfg.ClaudeModel,
@@ -90,10 +98,19 @@ func newClaudeRunner(cfg config.Config, server *serverClient, resolveBaseURL fun
 			HTTPClient:   server.httpClient(),
 			PollInterval: 500 * time.Millisecond,
 		},
+		onSelfUpdate: onSelfUpdate,
 	}
 }
 
 func (r *claudeRunner) RunTurn(ctx context.Context, dispatch taskDispatch, providerSessionRef string, profile turnExecutionProfile) (string, error) {
+	// If this turn was triggered by the CliUpdateBanner approve flow,
+	// fire the self-update hook once the turn finishes (success or
+	// failure). See runner_codex.go for the full rationale; for Claude
+	// the hook is mostly defensive because Claude CLI auto-updates itself.
+	if isSelfUpdateTurnPrompt(dispatch.Prompt) && r.onSelfUpdate != nil {
+		defer r.onSelfUpdate()
+	}
+
 	// deltaBuf MUST be a per-RunTurn local: the runner is a singleton shared
 	// across all concurrent task workers, so storing the buffer on the runner
 	// struct would let two sessions overwrite each other's session/task ids
@@ -141,17 +158,22 @@ func (r *claudeRunner) RunTurn(ctx context.Context, dispatch taskDispatch, provi
 	if claudeHookErr != nil {
 		log.Printf("[CLAUDE-HOOK] install failed taskRun=%s: %v", dispatch.TaskRunID, claudeHookErr)
 	}
-	defer claudeHookCleanup()
+	var claudeHookCleanupOnce sync.Once
+	cleanupClaudeHooks := func() {
+		claudeHookCleanupOnce.Do(claudeHookCleanup)
+	}
+	defer cleanupClaudeHooks()
 
-	systemPrompt := `IMPORTANT TOOL USAGE RULES:
+	runtimeInstructions := `IMPORTANT TOOL USAGE RULES:
 - To execute shell commands, you MUST use the MCP tool "mcp_pocketcode_run_command". Do NOT use Bash.
 - To write or modify files, use the native Edit, Write, MultiEdit, or NotebookEdit tools. Prefer Edit for targeted in-place changes; use Write only when creating a new file or fully overwriting it.
 - Use Read, Grep, and Glob freely for inspection.
 - Always call tools yourself in the main agent context — do not delegate to sub-agents.
 - For long-running service commands (dev server, start/serve, docker compose up, watch, tail -f), set executionMode="auto" and waitTimeoutSec=120 when calling run_command.
 `
+	appendSystemPrompt := appendInstructionBlocks(runtimeInstructions, agentRoleInstructions(dispatch))
 	prompt := dispatch.Prompt
-	if profile.ReadOnly {
+	if profile.AppendReadOnlyInstructions {
 		prompt += "\n\n(This is a read-only turn. Do not execute destructive commands or modify files.)"
 	}
 
@@ -174,7 +196,7 @@ func (r *claudeRunner) RunTurn(ctx context.Context, dispatch taskDispatch, provi
 		"Read", "Glob", "Grep",
 		"WebSearch", "WebFetch",
 		"--permission-mode", "default",
-		"--system-prompt", systemPrompt,
+		"--append-system-prompt", appendSystemPrompt,
 	}
 	model := strings.TrimSpace(dispatch.Model)
 	if model == "" {
@@ -244,6 +266,7 @@ func (r *claudeRunner) RunTurn(ctx context.Context, dispatch taskDispatch, provi
 	currentAssistantItemID := ""
 	fallbackAssistantIndex := 0
 	claudeUnknownTypeLogged := map[string]bool{}
+	var assistantText strings.Builder
 
 	scanner := bufio.NewScanner(stdout)
 	scanner.Buffer(make([]byte, 1024*1024), 4*1024*1024)
@@ -282,6 +305,7 @@ func (r *claudeRunner) RunTurn(ctx context.Context, dispatch taskDispatch, provi
 					currentAssistantItemID = fmt.Sprintf("%s:assistant:%d", dispatch.TaskRunID, fallbackAssistantIndex)
 					itemID = currentAssistantItemID
 				}
+				assistantText.WriteString(ev.Event.Delta.Text)
 				deltaBuf.Append(ctx, ev.Event.Delta.Text, itemID)
 			}
 
@@ -292,7 +316,7 @@ func (r *claudeRunner) RunTurn(ctx context.Context, dispatch taskDispatch, provi
 			// re-appending the snapshot text would duplicate the assistant
 			// reply in the timeline buffer.
 			itemID := strings.TrimSpace(ev.Message.ID)
-			if itemID != "" {
+			if itemID != "" && strings.TrimSpace(currentAssistantItemID) == "" {
 				currentAssistantItemID = itemID
 			}
 			if !streamOpen {
@@ -311,6 +335,7 @@ func (r *claudeRunner) RunTurn(ctx context.Context, dispatch taskDispatch, provi
 				}
 				for _, block := range ev.Message.Content {
 					if block.Type == "text" && block.Text != "" {
+						assistantText.WriteString(block.Text)
 						deltaBuf.Append(ctx, block.Text, flushItemID)
 					}
 				}
@@ -318,21 +343,27 @@ func (r *claudeRunner) RunTurn(ctx context.Context, dispatch taskDispatch, provi
 
 		case ev.Type == "result":
 			deltaBuf.Flush(ctx)
-			if ev.Result != "" {
+			completedText := ev.Result
+			if strings.TrimSpace(completedText) == "" {
+				completedText = assistantText.String()
+			}
+			if completedText != "" {
 				itemID := strings.TrimSpace(currentAssistantItemID)
 				if itemID == "" {
 					fallbackAssistantIndex++
 					itemID = fmt.Sprintf("%s:assistant:%d", dispatch.TaskRunID, fallbackAssistantIndex)
 				}
-				_ = r.server.postEvent(ctx, daemonEvent{
+				if err := r.server.postEvent(ctx, daemonEvent{
 					SessionID: dispatch.SessionID,
 					TaskRunID: dispatch.TaskRunID,
 					EventType: "assistant.message.completed",
 					Payload: map[string]any{
 						"itemId": itemID,
-						"text":   ev.Result,
+						"text":   completedText,
 					},
-				})
+				}); err != nil {
+					log.Printf("claude postEvent assistant.message.completed error: %v", err)
+				}
 				currentAssistantItemID = ""
 			}
 			if ev.SessionID != "" {
@@ -373,16 +404,22 @@ func (r *claudeRunner) RunTurn(ctx context.Context, dispatch taskDispatch, provi
 	if streamOpen {
 		_ = emitAssistantStreamEnded(ctx, r.server, dispatch, dispatch.TaskRunID)
 	}
+	cleanupClaudeHooks()
 	if err := profile.RunBeforeComplete(ctx); err != nil {
 		log.Printf("[CHANGESET] claude runner beforeComplete hook failed: %v", err)
+	}
+	completedPayload := map[string]any{
+		"status": "completed",
+	}
+	if strings.TrimSpace(sessionID) != "" {
+		completedPayload["providerSessionRef"] = strings.TrimSpace(sessionID)
+		completedPayload["sessionId"] = strings.TrimSpace(sessionID)
 	}
 	_ = r.server.postEvent(ctx, daemonEvent{
 		SessionID: dispatch.SessionID,
 		TaskRunID: dispatch.TaskRunID,
 		EventType: "turn.completed",
-		Payload: map[string]any{
-			"status": "completed",
-		},
+		Payload:   completedPayload,
 	})
 
 	return sessionID, nil

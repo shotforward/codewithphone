@@ -134,13 +134,13 @@ var PREVIEW_GEMINI_FLASH_MODEL = "gemini-3-flash-preview";
 		t.Fatalf("expected 7 models, got %d: %+v", len(models), models)
 	}
 	want := map[string]bool{
-		"gemini-2.5-pro":       true,
-		"gemini-2.5-flash":     true,
-		"gemini-3-pro-preview": true,
+		"gemini-2.5-pro":         true,
+		"gemini-2.5-flash":       true,
+		"gemini-3-pro-preview":   true,
 		"gemini-3-flash-preview": true,
-		"auto": true,
-		"pro":  true,
-		"flash": true,
+		"auto":                   true,
+		"pro":                    true,
+		"flash":                  true,
 	}
 	for _, m := range models {
 		if !want[m] {
@@ -166,6 +166,24 @@ func TestProbeGeminiModelsFallsBackOnMissingBundle(t *testing.T) {
 	}
 	if models[0] != geminiFallbackModels[0] {
 		t.Fatalf("expected fallback models, got %+v", models)
+	}
+}
+
+func TestNormalizeRuntimeCapabilityMovesDefaultModelFirst(t *testing.T) {
+	capability := normalizeRuntimeCapability(runtimeCapabilityPayload{
+		Runtime:      "gemini_cli",
+		DefaultModel: "gemini-3-flash-preview",
+		Models: []string{
+			"gemini-3-pro-preview",
+			"gemini-3-flash-preview",
+			"gemini-2.5-flash",
+		},
+	})
+	if got := capability.Models[0]; got != "gemini-3-flash-preview" {
+		t.Fatalf("first model = %q, want default model first; models=%+v", got, capability.Models)
+	}
+	if got := capability.DefaultModel; got != "gemini-3-flash-preview" {
+		t.Fatalf("default model = %q", got)
 	}
 }
 

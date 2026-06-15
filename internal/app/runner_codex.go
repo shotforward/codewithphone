@@ -25,6 +25,11 @@ type codexRunner struct {
 	codexBin  string
 	server    *serverClient
 	approvals approvalClient
+	// onSelfUpdate is invoked (in a fresh goroutine) after a turn whose
+	// prompt was produced by the CliUpdateBanner approve flow. It exists
+	// so the runner can request an immediate capability re-probe without
+	// taking a direct dependency on *Service. May be nil in tests.
+	onSelfUpdate func()
 }
 
 type codexRPCMessage struct {
@@ -94,7 +99,7 @@ type codexTurnState struct {
 	commandDenied         bool
 }
 
-func newCodexRunner(cfg config.Config, server *serverClient) *codexRunner {
+func newCodexRunner(cfg config.Config, server *serverClient, onSelfUpdate func()) *codexRunner {
 	return &codexRunner{
 		codexBin: cfg.CodexBin,
 		server:   server,
@@ -105,10 +110,21 @@ func newCodexRunner(cfg config.Config, server *serverClient) *codexRunner {
 			MachineID:    server.MachineID,
 			MachineToken: server.MachineToken,
 		},
+		onSelfUpdate: onSelfUpdate,
 	}
 }
 
 func (r *codexRunner) RunTurn(ctx context.Context, dispatch taskDispatch, providerSessionRef string, profile turnExecutionProfile) (sessionID string, err error) {
+	// If this turn was triggered by the CliUpdateBanner approve flow,
+	// fire the self-update hook once the turn finishes (success or
+	// failure). The hook (when wired to refreshRuntimeCapabilities) lets
+	// the UI see the new CLI version within seconds instead of waiting
+	// up to capabilityTicker (~10m). Registered first so it runs last,
+	// after the RPC subprocess and other defers have wound down.
+	if isSelfUpdateTurnPrompt(dispatch.Prompt) && r.onSelfUpdate != nil {
+		defer r.onSelfUpdate()
+	}
+
 	// deltaBuf MUST be a per-RunTurn local: the runner is a singleton shared
 	// across all concurrent task workers, so storing the buffer on the runner
 	// struct would let two sessions overwrite each other's session/task ids
@@ -146,7 +162,7 @@ func (r *codexRunner) RunTurn(ctx context.Context, dispatch taskDispatch, provid
 	log.Printf("[TIMING] codex initialize: %v", time.Since(t1))
 
 	t2 := time.Now()
-	threadID, err := rpc.openThread(ctx, dispatch.WorkspaceRoot, providerSessionRef, profile)
+	threadID, err := rpc.openThread(ctx, dispatch.WorkspaceRoot, providerSessionRef, profile, dispatch)
 	if err != nil {
 		return "", err
 	}
@@ -879,13 +895,13 @@ func (c *codexRPCClient) initialize(ctx context.Context) error {
 	return c.notify("initialized", map[string]any{})
 }
 
-func (c *codexRPCClient) openThread(ctx context.Context, workspaceRoot, providerSessionRef string, profile turnExecutionProfile) (string, error) {
+func (c *codexRPCClient) openThread(ctx context.Context, workspaceRoot, providerSessionRef string, profile turnExecutionProfile, dispatch taskDispatch) (string, error) {
 	params := map[string]any{
 		"cwd":            workspaceRoot,
 		"sandbox":        threadSandboxForProfile(profile),
 		"approvalPolicy": approvalPolicyForProfile(profile),
 	}
-	if instructions := developerInstructionsForProfile(profile); instructions != "" {
+	if instructions := developerInstructionsForProfile(profile, dispatch); instructions != "" {
 		params["developerInstructions"] = instructions
 	}
 
@@ -917,7 +933,7 @@ func (c *codexRPCClient) openThread(ctx context.Context, workspaceRoot, provider
 }
 
 func threadSandboxForProfile(profile turnExecutionProfile) string {
-	if profile.ReadOnly {
+	if profile.ThreadSandboxReadOnly {
 		return "read-only"
 	}
 	// workspace-write keeps Codex CLI's own boundary enforcement (writes
@@ -942,7 +958,7 @@ func approvalPolicyForProfile(profile turnExecutionProfile) string {
 
 func buildTurnPrompt(prompt string, profile turnExecutionProfile) string {
 	prompt = strings.TrimSpace(prompt)
-	if !profile.ReadOnly {
+	if !profile.AppendReadOnlyInstructions {
 		return prompt
 	}
 
@@ -958,7 +974,7 @@ func buildTurnPrompt(prompt string, profile turnExecutionProfile) string {
 	return prompt + "\n\n" + extra
 }
 
-func developerInstructionsForProfile(profile turnExecutionProfile) string {
+func developerInstructionsForProfile(profile turnExecutionProfile, dispatch taskDispatch) string {
 	// Always nudge Codex toward its built-in apply_patch tool for text file
 	// changes. This makes the daemon receive a structured `fileChange` item
 	// (and emit `file.touched`) instead of a `Execution` item with a
@@ -967,10 +983,11 @@ func developerInstructionsForProfile(profile turnExecutionProfile) string {
 		"Use shell commands only for filesystem operations that apply_patch cannot express " +
 		"(mkdir, chmod, mv, rm of directories, binary files, or running build/test tooling)."
 
-	if !profile.ReadOnly {
-		return fileEditPreference
+	roleInstructions := agentRoleInstructions(dispatch)
+	if !profile.AppendReadOnlyInstructions {
+		return appendInstructionBlocks(fileEditPreference, roleInstructions)
 	}
-	return strings.Join([]string{
+	readOnlyInstructions := strings.Join([]string{
 		"This is a read-only repository overview turn.",
 		"Do not make file changes and do not request file-change approvals.",
 		"Use at most 5 shell commands and at most 8 file reads.",
@@ -979,6 +996,7 @@ func developerInstructionsForProfile(profile turnExecutionProfile) string {
 		"Once you can explain the project goal, architecture, and current implementation stage, stop and answer immediately.",
 		fileEditPreference,
 	}, " ")
+	return appendInstructionBlocks(readOnlyInstructions, roleInstructions)
 }
 
 func shouldEarlyFinalizeReadOnlyTurn(text string, completedCommandCount int) bool {

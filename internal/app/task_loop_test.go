@@ -31,16 +31,32 @@ type recordingTurnRunner struct {
 }
 
 type turnExecutionCall struct {
+	Dispatch           taskDispatch
 	ProviderSessionRef string
 	Profile            turnExecutionProfile
 }
 
-func (r recordingTurnRunner) RunTurn(_ context.Context, _ taskDispatch, providerSessionRef string, profile turnExecutionProfile) (string, error) {
-	r.calls <- turnExecutionCall{ProviderSessionRef: providerSessionRef, Profile: profile}
+func (r recordingTurnRunner) RunTurn(_ context.Context, dispatch taskDispatch, providerSessionRef string, profile turnExecutionProfile) (string, error) {
+	r.calls <- turnExecutionCall{Dispatch: dispatch, ProviderSessionRef: providerSessionRef, Profile: profile}
 	if providerSessionRef != "" {
 		return providerSessionRef, nil
 	}
 	return "thr_test_resume", nil
+}
+
+type agentSessionRecordingRunner struct {
+	calls chan turnExecutionCall
+}
+
+func (r agentSessionRecordingRunner) RunTurn(_ context.Context, dispatch taskDispatch, providerSessionRef string, profile turnExecutionProfile) (string, error) {
+	r.calls <- turnExecutionCall{Dispatch: dispatch, ProviderSessionRef: providerSessionRef, Profile: profile}
+	if providerSessionRef != "" {
+		return providerSessionRef, nil
+	}
+	if dispatch.AgentSessionID != "" {
+		return "thr_" + dispatch.AgentSessionID, nil
+	}
+	return "thr_group", nil
 }
 
 func TestRunTaskLoopClaimsTaskAndInvokesRunner(t *testing.T) {
@@ -169,7 +185,7 @@ func TestHandleCodexDispatchReusesStoredProviderSession(t *testing.T) {
 		SessionID:     "sess_001",
 		Runtime:       "codex_cli",
 		WorkspaceRoot: workspaceRoot,
-		Prompt:        "帮我介绍下这个项目",
+		Prompt:        "只读，不要修改文件，帮我介绍下这个项目",
 	}
 	if err := svc.handleCodexDispatch(context.Background(), secondDispatch); err != nil {
 		t.Fatalf("second dispatch failed: %v", err)
@@ -178,6 +194,131 @@ func TestHandleCodexDispatchReusesStoredProviderSession(t *testing.T) {
 		t.Fatalf("expected second dispatch to reuse stored provider session ref, got %q", got.ProviderSessionRef)
 	} else if !got.Profile.ReadOnly {
 		t.Fatal("expected project introduction prompt to run in read-only mode")
+	}
+}
+
+func TestHandleCodexDispatchScopesProviderSessionByAgentSession(t *testing.T) {
+	calls := make(chan turnExecutionCall, 3)
+	workspaceRoot := t.TempDir()
+	if err := os.WriteFile(filepath.Join(workspaceRoot, "README.md"), []byte("hello\n"), 0o644); err != nil {
+		t.Fatalf("write workspace file: %v", err)
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v1/machines/machine-test/events" {
+			w.WriteHeader(http.StatusAccepted)
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer server.Close()
+
+	svc := &Service{
+		cfg:              configFixture(),
+		providerSessions: map[string]string{},
+		serverClient: serverClient{
+			BaseURL:    server.URL,
+			MachineID:  "machine-test",
+			HTTPClient: server.Client(),
+		},
+		codexRunner: agentSessionRecordingRunner{calls: calls},
+	}
+
+	firstPM := taskDispatch{
+		TaskRunID:      "task_pm_001",
+		SessionID:      "sess_001",
+		AgentSessionID: "asess_pm",
+		AgentID:        "pm",
+		Runtime:        "codex_cli",
+		WorkspaceRoot:  workspaceRoot,
+		Prompt:         "只读，不要修改文件，帮我介绍下这个项目",
+	}
+	if err := svc.handleCodexDispatch(context.Background(), firstPM); err != nil {
+		t.Fatalf("first PM dispatch failed: %v", err)
+	}
+	if got := <-calls; got.ProviderSessionRef != "" || got.Dispatch.AgentSessionID != "asess_pm" {
+		t.Fatalf("expected first PM dispatch to start a new agent provider session, got %+v", got)
+	}
+
+	dev := taskDispatch{
+		TaskRunID:      "task_dev_001",
+		SessionID:      "sess_001",
+		AgentSessionID: "asess_dev",
+		AgentID:        "dev",
+		Runtime:        "codex_cli",
+		WorkspaceRoot:  workspaceRoot,
+		Prompt:         "只读，不要修改文件，帮我介绍下这个项目",
+	}
+	if err := svc.handleCodexDispatch(context.Background(), dev); err != nil {
+		t.Fatalf("dev dispatch failed: %v", err)
+	}
+	if got := <-calls; got.ProviderSessionRef != "" || got.Dispatch.AgentSessionID != "asess_dev" {
+		t.Fatalf("expected dev dispatch to start a separate agent provider session, got %+v", got)
+	}
+
+	secondPM := firstPM
+	secondPM.TaskRunID = "task_pm_002"
+	if err := svc.handleCodexDispatch(context.Background(), secondPM); err != nil {
+		t.Fatalf("second PM dispatch failed: %v", err)
+	}
+	if got := <-calls; got.ProviderSessionRef != "thr_asess_pm" || got.Dispatch.AgentSessionID != "asess_pm" {
+		t.Fatalf("expected second PM dispatch to reuse PM provider session, got %+v", got)
+	}
+
+	if got := svc.getProviderSession("sess_001"); got != "" {
+		t.Fatalf("expected v2 dispatches not to store provider session under group session, got %q", got)
+	}
+	if got := svc.getProviderSession("agent:asess_pm"); got != "thr_asess_pm" {
+		t.Fatalf("expected PM provider session ref to be stored separately, got %q", got)
+	}
+	if got := svc.getProviderSession("agent:asess_dev"); got != "thr_asess_dev" {
+		t.Fatalf("expected dev provider session ref to be stored separately, got %q", got)
+	}
+}
+
+func TestHandleCodexDispatchUsesServerProviderSessionRefWhenLocalStateMissing(t *testing.T) {
+	calls := make(chan turnExecutionCall, 1)
+	workspaceRoot := t.TempDir()
+	if err := os.WriteFile(filepath.Join(workspaceRoot, "README.md"), []byte("hello\n"), 0o644); err != nil {
+		t.Fatalf("write workspace file: %v", err)
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v1/machines/machine-test/events" {
+			w.WriteHeader(http.StatusAccepted)
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer server.Close()
+
+	svc := &Service{
+		cfg:              configFixture(),
+		providerSessions: map[string]string{},
+		serverClient: serverClient{
+			BaseURL:    server.URL,
+			MachineID:  "machine-test",
+			HTTPClient: server.Client(),
+		},
+		codexRunner: recordingTurnRunner{calls: calls},
+	}
+
+	dispatch := taskDispatch{
+		TaskRunID:          "task_pm_001",
+		SessionID:          "sess_001",
+		AgentSessionID:     "asess_pm",
+		AgentID:            "pm",
+		ProviderSessionRef: "thr_from_server",
+		Runtime:            "codex_cli",
+		WorkspaceRoot:      workspaceRoot,
+		Prompt:             "继续上一轮讨论",
+	}
+	if err := svc.handleCodexDispatch(context.Background(), dispatch); err != nil {
+		t.Fatalf("dispatch failed: %v", err)
+	}
+	if got := <-calls; got.ProviderSessionRef != "thr_from_server" {
+		t.Fatalf("expected server provider session ref to be used, got %q", got.ProviderSessionRef)
+	}
+	if got := svc.getProviderSession("agent:asess_pm"); got != "thr_from_server" {
+		t.Fatalf("expected server provider session ref to be cached locally, got %q", got)
 	}
 }
 
