@@ -7,6 +7,7 @@ import (
 	"crypto/cipher"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
@@ -303,19 +304,23 @@ deny_message = "No user interactive console is available. Use mcp_pocketcode_run
 	stderrDone := make(chan struct{})
 	go func() {
 		defer close(stderrDone)
-		scanner := bufio.NewScanner(stderr)
-		scanner.Buffer(make([]byte, 64*1024), 2*1024*1024)
-		for scanner.Scan() {
-			line := scanner.Text()
+		reader := bufio.NewReaderSize(stderr, 64*1024)
+		for {
+			lineBytes, err := readRunnerLine(reader, runnerStderrLineLimitBytes, "gemini stderr")
+			if err != nil {
+				if errors.Is(err, io.EOF) {
+					return
+				}
+				stderrTail.Add("stderr read error: " + err.Error())
+				log.Printf("gemini stderr read error: %v", err)
+				continue
+			}
+			line := string(lineBytes)
 			if strings.Contains(line, "libsecret") || strings.Contains(line, "FileKeychain") || strings.Contains(line, "Loaded cached credentials") {
 				continue
 			}
 			stderrTail.Add(line)
 			log.Printf("gemini stderr: %s", line)
-		}
-		if err := scanner.Err(); err != nil {
-			stderrTail.Add("stderr scanner error: " + err.Error())
-			log.Printf("gemini stderr scanner error: %v", err)
 		}
 	}()
 
@@ -329,14 +334,21 @@ deny_message = "No user interactive console is available. Use mcp_pocketcode_run
 	var assistantText strings.Builder
 	assistantCompleted := false
 
-	scanner := bufio.NewScanner(stdout)
-	scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
-	for scanner.Scan() {
+	reader := bufio.NewReaderSize(stdout, 64*1024)
+	var scanErr error
+	for {
+		line, err := readRunnerLine(reader, runnerStdoutLineLimitBytes, "gemini stdout")
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			scanErr = err
+			break
+		}
 		if firstOutput {
 			log.Printf("[TIMING] gemini first stdout output: %v after start", time.Since(tStart))
 			firstOutput = false
 		}
-		line := scanner.Bytes()
 		var raw map[string]any
 		if err := json.Unmarshal(line, &raw); err != nil {
 			continue
@@ -445,10 +457,9 @@ deny_message = "No user interactive console is available. Use mcp_pocketcode_run
 		}
 	}
 
-	scanErr := scanner.Err()
 	if scanErr != nil {
-		log.Printf("gemini scanner error: %v", scanErr)
-		stderrTail.Add("stdout scanner error: " + scanErr.Error())
+		log.Printf("gemini stdout read error: %v", scanErr)
+		stderrTail.Add("stdout read error: " + scanErr.Error())
 	}
 
 	log.Printf("[TIMING] gemini stream processing done: %v after first output", time.Since(tFirstOutput))

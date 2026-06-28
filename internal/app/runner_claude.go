@@ -4,7 +4,9 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"os/exec"
@@ -244,19 +246,23 @@ func (r *claudeRunner) RunTurn(ctx context.Context, dispatch taskDispatch, provi
 	stderrDone := make(chan struct{})
 	go func() {
 		defer close(stderrDone)
-		scanner := bufio.NewScanner(stderr)
-		scanner.Buffer(make([]byte, 64*1024), 1024*1024)
-		for scanner.Scan() {
-			line := scanner.Text()
+		reader := bufio.NewReaderSize(stderr, 64*1024)
+		for {
+			lineBytes, err := readRunnerLine(reader, runnerStderrLineLimitBytes, "claude stderr")
+			if err != nil {
+				if errors.Is(err, io.EOF) {
+					return
+				}
+				stderrTail.Add("stderr read error: " + err.Error())
+				log.Printf("claude stderr read error: %v", err)
+				continue
+			}
+			line := string(lineBytes)
 			if strings.Contains(line, "ExperimentalWarning") || strings.Contains(line, "fetch") {
 				continue
 			}
 			stderrTail.Add(line)
 			log.Printf("claude stderr: %s", line)
-		}
-		if err := scanner.Err(); err != nil {
-			stderrTail.Add("stderr scanner error: " + err.Error())
-			log.Printf("claude stderr scanner error: %v", err)
 		}
 	}()
 
@@ -268,15 +274,22 @@ func (r *claudeRunner) RunTurn(ctx context.Context, dispatch taskDispatch, provi
 	claudeUnknownTypeLogged := map[string]bool{}
 	var assistantText strings.Builder
 
-	scanner := bufio.NewScanner(stdout)
-	scanner.Buffer(make([]byte, 1024*1024), 4*1024*1024)
-	for scanner.Scan() {
+	reader := bufio.NewReaderSize(stdout, 64*1024)
+	var scanErr error
+	for {
+		line, err := readRunnerLine(reader, runnerStdoutLineLimitBytes, "claude stdout")
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			scanErr = err
+			break
+		}
 		if firstOutput {
 			log.Printf("[TIMING] claude first stdout output: %v after start", time.Since(tStart))
 			firstOutput = false
 		}
 
-		line := scanner.Bytes()
 		var ev claudeStreamEvent
 		if err := json.Unmarshal(line, &ev); err != nil {
 			continue
@@ -382,10 +395,9 @@ func (r *claudeRunner) RunTurn(ctx context.Context, dispatch taskDispatch, provi
 		}
 	}
 
-	scanErr := scanner.Err()
 	if scanErr != nil {
-		log.Printf("claude scanner error: %v", scanErr)
-		stderrTail.Add("stdout scanner error: " + scanErr.Error())
+		log.Printf("claude stdout read error: %v", scanErr)
+		stderrTail.Add("stdout read error: " + scanErr.Error())
 	}
 
 	waitErr := cmd.Wait()

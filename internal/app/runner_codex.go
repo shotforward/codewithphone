@@ -824,7 +824,7 @@ func approvalActionIDFromRequest(taskRunID string, approvalID string, rawID json
 type codexRPCClient struct {
 	cmd        *exec.Cmd
 	stdin      io.WriteCloser
-	scanner    *bufio.Scanner
+	reader     *bufio.Reader
 	nextID     atomic.Int64
 	stderrTail *stderrTailBuffer
 }
@@ -856,13 +856,12 @@ func startCodexRPC(ctx context.Context, codexBin string) (*codexRPCClient, error
 	stderrTail := newStderrTailBuffer(runnerStderrTailLimit)
 	go drainCodexStderr(stderr, stderrTail)
 
-	scanner := bufio.NewScanner(stdout)
-	scanner.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
+	reader := bufio.NewReaderSize(stdout, 64*1024)
 
 	client := &codexRPCClient{
 		cmd:        cmd,
 		stdin:      stdin,
-		scanner:    scanner,
+		reader:     reader,
 		stderrTail: stderrTail,
 	}
 	client.nextID.Store(1)
@@ -1073,28 +1072,44 @@ func (c *codexRPCClient) write(payload any) error {
 }
 
 func (c *codexRPCClient) readMessage() (codexRPCMessage, error) {
-	if !c.scanner.Scan() {
-		if err := c.scanner.Err(); err != nil {
+	for {
+		line, err := readRunnerLine(c.reader, runnerStdoutLineLimitBytes, "codex stdout")
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				return codexRPCMessage{}, io.EOF
+			}
 			return codexRPCMessage{}, err
 		}
-		return codexRPCMessage{}, io.EOF
+		if len(bytes.TrimSpace(line)) == 0 {
+			continue
+		}
+		var msg codexRPCMessage
+		if err := json.Unmarshal(line, &msg); err != nil {
+			return codexRPCMessage{}, err
+		}
+		return msg, nil
 	}
-	var msg codexRPCMessage
-	if err := json.Unmarshal(c.scanner.Bytes(), &msg); err != nil {
-		return codexRPCMessage{}, err
-	}
-	return msg, nil
 }
 
 func drainCodexStderr(stderr io.ReadCloser, tail *stderrTailBuffer) {
 	defer stderr.Close()
-	scanner := bufio.NewScanner(stderr)
-	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
-	for scanner.Scan() {
-		line := scanner.Text()
-		if tail != nil {
-			tail.Add(line)
+	reader := bufio.NewReaderSize(stderr, 64*1024)
+	for {
+		line, err := readRunnerLine(reader, runnerStderrLineLimitBytes, "codex stderr")
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				return
+			}
+			message := "stderr read error: " + err.Error()
+			if tail != nil {
+				tail.Add(message)
+			}
+			log.Printf("codex stderr read error: %v", err)
+			continue
 		}
-		log.Printf("codex app-server: %s", line)
+		if tail != nil {
+			tail.Add(string(line))
+		}
+		log.Printf("codex app-server: %s", string(line))
 	}
 }
