@@ -40,12 +40,12 @@ func (s *Service) runTaskWorker(ctx context.Context, workerID int) {
 		if err != nil {
 			log.Printf("worker=%d claim task failed: %v", workerID, err)
 		} else if dispatch != nil {
-			log.Printf("[TIMING] worker=%d task claimed: session=%s taskRun=%s runtime=%s", workerID, dispatch.SessionID, dispatch.TaskRunID, dispatch.Runtime)
+			debugLogf("[TIMING] worker=%d task claimed: session=%s taskRun=%s runtime=%s", workerID, dispatch.SessionID, dispatch.TaskRunID, dispatch.Runtime)
 			t1 := time.Now()
 			if err := s.handleDispatch(ctx, *dispatch); err != nil {
 				log.Printf("worker=%d handle dispatch %s failed: %v", workerID, dispatch.TaskRunID, err)
 			}
-			log.Printf("[TIMING] worker=%d handleDispatch total: %v", workerID, time.Since(t1))
+			debugLogf("[TIMING] worker=%d handleDispatch total: %v", workerID, time.Since(t1))
 			continue
 		}
 
@@ -170,7 +170,7 @@ func (s *Service) handleRunnerDispatch(ctx context.Context, dispatch taskDispatc
 		log.Printf("failed to emit turn.phase.changed(%s): %v", currentPhase, err)
 	}
 	setPhase(turnPhaseAnalyzing)
-	log.Printf("[TIMING] postEvent(turn.started): %v", time.Since(t0))
+	debugLogf("[TIMING] postEvent(turn.started): %v", time.Since(t0))
 
 	heartbeatStop := make(chan struct{})
 	heartbeatStartedAt := time.Now()
@@ -208,7 +208,7 @@ func (s *Service) handleRunnerDispatch(ctx context.Context, dispatch taskDispatc
 	if profile.TrackChanges {
 		t1 := time.Now()
 		snapshot, err = changeset.CreateSnapshot(dispatch.WorkspaceRoot)
-		log.Printf("[TIMING] changeset.CreateSnapshot: %v", time.Since(t1))
+		debugLogf("[TIMING] changeset.CreateSnapshot: %v", time.Since(t1))
 		if err != nil {
 			log.Printf("[CHANGESET] taskRun=%s changeset.CreateSnapshot failed: %v (workspaceRoot=%s)", dispatch.TaskRunID, err, dispatch.WorkspaceRoot)
 			return err
@@ -290,10 +290,10 @@ func (s *Service) handleRunnerDispatch(ctx context.Context, dispatch taskDispatc
 	if strings.TrimSpace(providerSessionRef) == "" {
 		providerSessionRef = strings.TrimSpace(dispatch.ProviderSessionRef)
 	}
-	log.Printf("[TIMING] pre-RunTurn setup: %v", time.Since(dispatchStart))
+	debugLogf("[TIMING] pre-RunTurn setup: %v", time.Since(dispatchStart))
 	t2 := time.Now()
 	nextRef, err := runner.RunTurn(taskCtx, dispatch, providerSessionRef, profile)
-	log.Printf("[TIMING] RunTurn: %v", time.Since(t2))
+	debugLogf("[TIMING] RunTurn: %v", time.Since(t2))
 	if nextRef != "" {
 		s.setProviderSession(providerSessionKey, nextRef)
 	}

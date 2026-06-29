@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
 	"net/http"
 	"strings"
 	"time"
@@ -147,7 +146,7 @@ func (c serverClient) postEvent(ctx context.Context, evt daemonEvent) error {
 	t0 := time.Now()
 	resp, err := c.httpClient().Do(req)
 	if dur := time.Since(t0); dur > 50*time.Millisecond {
-		log.Printf("[TIMING] postEvent HTTP %s: %v", evt.EventType, dur)
+		debugLogf("[TIMING] postEvent HTTP %s: %v", evt.EventType, dur)
 	}
 	if err != nil {
 		return err

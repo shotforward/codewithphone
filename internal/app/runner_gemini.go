@@ -180,7 +180,7 @@ func (r *geminiRunner) RunTurn(ctx context.Context, dispatch taskDispatch, provi
 	if err := syncGeminiConfig(defaultGeminiConfigDir, geminiConfigDir); err != nil {
 		return "", err
 	}
-	log.Printf("[TIMING] syncGeminiConfig: %v", time.Since(t0))
+	debugLogf("[TIMING] syncGeminiConfig: %v", time.Since(t0))
 	if err := os.MkdirAll(filepath.Join(geminiConfigDir, "policies"), 0o755); err != nil {
 		return "", fmt.Errorf("failed to setup gemini home: %w", err)
 	}
@@ -293,12 +293,12 @@ deny_message = "No user interactive console is available. Use mcp_pocketcode_run
 		return "", err
 	}
 
-	log.Printf("[TIMING] gemini pre-start setup: %v", time.Since(runTurnStart))
+	debugLogf("[TIMING] gemini pre-start setup: %v", time.Since(runTurnStart))
 	tStart := time.Now()
 	if err := cmd.Start(); err != nil {
 		return "", err
 	}
-	log.Printf("[TIMING] gemini cmd.Start(): %v", time.Since(tStart))
+	debugLogf("[TIMING] gemini cmd.Start(): %v", time.Since(tStart))
 
 	stderrTail := newStderrTailBuffer(runnerStderrTailLimit)
 	stderrDone := make(chan struct{})
@@ -313,7 +313,7 @@ deny_message = "No user interactive console is available. Use mcp_pocketcode_run
 				}
 				stderrTail.Add("stderr read error: " + err.Error())
 				log.Printf("gemini stderr read error: %v", err)
-				continue
+				return
 			}
 			line := string(lineBytes)
 			if strings.Contains(line, "libsecret") || strings.Contains(line, "FileKeychain") || strings.Contains(line, "Loaded cached credentials") {
@@ -346,7 +346,7 @@ deny_message = "No user interactive console is available. Use mcp_pocketcode_run
 			break
 		}
 		if firstOutput {
-			log.Printf("[TIMING] gemini first stdout output: %v after start", time.Since(tStart))
+			debugLogf("[TIMING] gemini first stdout output: %v after start", time.Since(tStart))
 			firstOutput = false
 		}
 		var raw map[string]any
@@ -462,7 +462,7 @@ deny_message = "No user interactive console is available. Use mcp_pocketcode_run
 		stderrTail.Add("stdout read error: " + scanErr.Error())
 	}
 
-	log.Printf("[TIMING] gemini stream processing done: %v after first output", time.Since(tFirstOutput))
+	debugLogf("[TIMING] gemini stream processing done: %v after first output", time.Since(tFirstOutput))
 	waitErr := cmd.Wait()
 	<-stderrDone
 	if waitErr != nil {

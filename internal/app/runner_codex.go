@@ -138,7 +138,7 @@ func (r *codexRunner) RunTurn(ctx context.Context, dispatch taskDispatch, provid
 	if rpcErr != nil {
 		return "", rpcErr
 	}
-	log.Printf("[TIMING] codex startRPC: %v", time.Since(t0))
+	debugLogf("[TIMING] codex startRPC: %v", time.Since(t0))
 	defer rpc.close()
 	// On any error path below, attach the captured stderr tail so the
 	// dispatch layer can surface it on turn.failed events. Errors that
@@ -159,14 +159,14 @@ func (r *codexRunner) RunTurn(ctx context.Context, dispatch taskDispatch, provid
 	if err := rpc.initialize(ctx); err != nil {
 		return "", err
 	}
-	log.Printf("[TIMING] codex initialize: %v", time.Since(t1))
+	debugLogf("[TIMING] codex initialize: %v", time.Since(t1))
 
 	t2 := time.Now()
 	threadID, err := rpc.openThread(ctx, dispatch.WorkspaceRoot, providerSessionRef, profile, dispatch)
 	if err != nil {
 		return "", err
 	}
-	log.Printf("[TIMING] codex openThread: %v", time.Since(t2))
+	debugLogf("[TIMING] codex openThread: %v", time.Since(t2))
 
 	t3 := time.Now()
 	if _, err := rpc.request(ctx, "turn/start", map[string]any{
@@ -183,7 +183,7 @@ func (r *codexRunner) RunTurn(ctx context.Context, dispatch taskDispatch, provid
 	}); err != nil {
 		return threadID, err
 	}
-	log.Printf("[TIMING] codex turn/start completed: %v", time.Since(t3))
+	debugLogf("[TIMING] codex turn/start completed: %v", time.Since(t3))
 	if state.earlyFinalize {
 		deltaBuf.Flush(ctx)
 		r.closeAssistantStream(ctx, dispatch, state, "")
@@ -358,7 +358,7 @@ func (r *codexRunner) handleAsyncMessage(ctx context.Context, rpc *codexRPCClien
 	default:
 		// Defensive: log unknown methods so future Codex CLI additions are
 		// visible in daemon logs instead of being silently dropped.
-		log.Printf("[CODEX] unhandled async method=%q (taskRun=%s)", msg.Method, dispatch.TaskRunID)
+		debugLogf("[CODEX] unhandled async method=%q (taskRun=%s)", msg.Method, dispatch.TaskRunID)
 		return false, nil
 	}
 }
@@ -397,7 +397,7 @@ func (r *codexRunner) handleItemStarted(ctx context.Context, dispatch taskDispat
 		r.emitPhase(ctx, dispatch, state, turnPhaseAnalyzing)
 		return nil
 	default:
-		log.Printf("[CODEX] unhandled item/started type=%q (taskRun=%s)", itemType(payload.Item), dispatch.TaskRunID)
+		debugLogf("[CODEX] unhandled item/started type=%q (taskRun=%s)", itemType(payload.Item), dispatch.TaskRunID)
 		return nil
 	}
 }
@@ -477,7 +477,7 @@ func (r *codexRunner) handleItemCompleted(ctx context.Context, dispatch taskDisp
 		r.emitPhase(ctx, dispatch, state, turnPhaseAnalyzing)
 		return nil
 	default:
-		log.Printf("[CODEX] unhandled item/completed type=%q (taskRun=%s)", itemType(payload.Item), dispatch.TaskRunID)
+		debugLogf("[CODEX] unhandled item/completed type=%q (taskRun=%s)", itemType(payload.Item), dispatch.TaskRunID)
 		return nil
 	}
 }
@@ -1105,7 +1105,7 @@ func drainCodexStderr(stderr io.ReadCloser, tail *stderrTailBuffer) {
 				tail.Add(message)
 			}
 			log.Printf("codex stderr read error: %v", err)
-			continue
+			return
 		}
 		if tail != nil {
 			tail.Add(string(line))

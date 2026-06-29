@@ -4,8 +4,10 @@ import (
 	"bufio"
 	"errors"
 	"io"
+	"log"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestReadRunnerLineReturnsLineWithoutNewline(t *testing.T) {
@@ -64,4 +66,34 @@ func TestReadRunnerLineTooLongDrainsCurrentLine(t *testing.T) {
 	if string(line) != "ok" {
 		t.Fatalf("line after drain = %q, want ok", string(line))
 	}
+}
+
+func TestDrainCodexStderrStopsOnReadError(t *testing.T) {
+	originalOutput := log.Writer()
+	log.SetOutput(io.Discard)
+	t.Cleanup(func() { log.SetOutput(originalOutput) })
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		drainCodexStderr(errReadCloser{err: errors.New("read |0: file already closed")}, newStderrTailBuffer(4))
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("drainCodexStderr did not stop after read error")
+	}
+}
+
+type errReadCloser struct {
+	err error
+}
+
+func (r errReadCloser) Read(_ []byte) (int, error) {
+	return 0, r.err
+}
+
+func (r errReadCloser) Close() error {
+	return nil
 }

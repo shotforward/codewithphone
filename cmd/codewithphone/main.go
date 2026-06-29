@@ -182,6 +182,17 @@ func cmdStart(args []string) {
 		os.Setenv("DAEMON_ALLOWED_ROOTS", flags.workspace)
 	}
 
+	if shouldUseManagedLogging(config.LogPath()) {
+		_ = os.MkdirAll(config.HomeDir(), 0o700)
+		_ = os.Chmod(config.HomeDir(), 0o700)
+		logWriter, closeLog, err := configureBackgroundLogging(config.LogPath())
+		if err != nil {
+			log.Fatalf("cannot configure background log: %v", err)
+		}
+		log.SetOutput(logWriter)
+		defer closeLog()
+	}
+
 	// Check if already running.
 	if pid := readPID(); pid > 0 {
 		if isProcessRunning(pid) {
@@ -291,16 +302,17 @@ func daemonize(originalArgs []string) {
 
 	_ = os.MkdirAll(config.HomeDir(), 0o700)
 	_ = os.Chmod(config.HomeDir(), 0o700)
-	logFile, err := os.OpenFile(config.LogPath(), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+	devNull, err := os.OpenFile(os.DevNull, os.O_WRONLY, 0)
 	if err != nil {
-		log.Fatalf("cannot open log file: %v", err)
+		log.Fatalf("cannot open %s: %v", os.DevNull, err)
 	}
+	defer devNull.Close()
 
 	cmd := exec.Command(exe, childArgs...)
-	cmd.Stdout = logFile
-	cmd.Stderr = logFile
+	cmd.Stdout = devNull
+	cmd.Stderr = devNull
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
-	cmd.Env = os.Environ()
+	cmd.Env = append(os.Environ(), backgroundLogEnv+"=1")
 
 	if err := cmd.Start(); err != nil {
 		log.Fatalf("failed to start background process: %v", err)
@@ -310,7 +322,6 @@ func daemonize(originalArgs []string) {
 	fmt.Printf("  log: %s\n", config.LogPath())
 
 	// Detach — don't wait for child.
-	_ = logFile.Close()
 }
 
 func cmdStop() {

@@ -235,12 +235,12 @@ func (r *claudeRunner) RunTurn(ctx context.Context, dispatch taskDispatch, provi
 		return "", err
 	}
 
-	log.Printf("[TIMING] claude pre-start setup: %v", time.Since(runTurnStart))
+	debugLogf("[TIMING] claude pre-start setup: %v", time.Since(runTurnStart))
 	tStart := time.Now()
 	if err := cmd.Start(); err != nil {
 		return "", err
 	}
-	log.Printf("[TIMING] claude cmd.Start(): %v", time.Since(tStart))
+	debugLogf("[TIMING] claude cmd.Start(): %v", time.Since(tStart))
 
 	stderrTail := newStderrTailBuffer(runnerStderrTailLimit)
 	stderrDone := make(chan struct{})
@@ -255,7 +255,7 @@ func (r *claudeRunner) RunTurn(ctx context.Context, dispatch taskDispatch, provi
 				}
 				stderrTail.Add("stderr read error: " + err.Error())
 				log.Printf("claude stderr read error: %v", err)
-				continue
+				return
 			}
 			line := string(lineBytes)
 			if strings.Contains(line, "ExperimentalWarning") || strings.Contains(line, "fetch") {
@@ -286,7 +286,7 @@ func (r *claudeRunner) RunTurn(ctx context.Context, dispatch taskDispatch, provi
 			break
 		}
 		if firstOutput {
-			log.Printf("[TIMING] claude first stdout output: %v after start", time.Since(tStart))
+			debugLogf("[TIMING] claude first stdout output: %v after start", time.Since(tStart))
 			firstOutput = false
 		}
 
