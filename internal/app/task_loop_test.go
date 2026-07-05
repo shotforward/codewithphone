@@ -197,6 +197,80 @@ func TestHandleCodexDispatchReusesStoredProviderSession(t *testing.T) {
 	}
 }
 
+func TestHandleCodexDispatchRepairsMissingTerminalEvent(t *testing.T) {
+	calls := make(chan turnExecutionCall, 1)
+	events := make(chan daemonEvent, 10)
+	workspaceRoot := t.TempDir()
+	if err := os.WriteFile(filepath.Join(workspaceRoot, "README.md"), []byte("hello\n"), 0o644); err != nil {
+		t.Fatalf("write workspace file: %v", err)
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/machines/machine-test/events":
+			var event daemonEvent
+			if err := json.NewDecoder(r.Body).Decode(&event); err != nil {
+				t.Fatalf("decode event: %v", err)
+			}
+			events <- event
+			w.WriteHeader(http.StatusAccepted)
+		case "/v1/machines/machine-test/tasks/task_missing_terminal/status":
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]string{"status": "running"})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	svc := &Service{
+		cfg:              configFixture(),
+		providerSessions: map[string]string{},
+		serverClient: serverClient{
+			BaseURL:    server.URL,
+			MachineID:  "machine-test",
+			HTTPClient: server.Client(),
+		},
+		codexRunner: recordingTurnRunner{calls: calls},
+		changeSets: changeSetClient{
+			BaseURL:    server.URL,
+			HTTPClient: server.Client(),
+		},
+	}
+
+	dispatch := taskDispatch{
+		TaskRunID:     "task_missing_terminal",
+		SessionID:     "sess_001",
+		Runtime:       "codex_cli",
+		WorkspaceRoot: workspaceRoot,
+		Prompt:        "只读，不要修改文件，帮我介绍下这个项目",
+	}
+	if err := svc.handleCodexDispatch(context.Background(), dispatch); err != nil {
+		t.Fatalf("dispatch failed: %v", err)
+	}
+
+	foundTerminalRepair := false
+	for {
+		select {
+		case event := <-events:
+			if event.EventType != "turn.completed" {
+				continue
+			}
+			payload, ok := event.Payload.(map[string]any)
+			if !ok {
+				t.Fatalf("turn.completed payload type = %T", event.Payload)
+			}
+			if payload["completionReason"] == "daemon_terminal_repair" {
+				foundTerminalRepair = true
+			}
+		default:
+			if !foundTerminalRepair {
+				t.Fatal("missing repaired turn.completed event")
+			}
+			return
+		}
+	}
+}
+
 func TestHandleCodexDispatchScopesProviderSessionByAgentSession(t *testing.T) {
 	calls := make(chan turnExecutionCall, 3)
 	workspaceRoot := t.TempDir()

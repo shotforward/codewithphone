@@ -117,9 +117,10 @@ type runtimeStateResponse struct {
 
 func New(cfg config.Config, opts ...Option) *Service {
 	client := serverClient{
-		BaseURL:      cfg.ServerBaseURL,
-		MachineID:    cfg.MachineID,
-		MachineToken: cfg.MachineToken,
+		BaseURL:                  cfg.ServerBaseURL,
+		MachineID:                cfg.MachineID,
+		MachineToken:             cfg.MachineToken,
+		PendingTerminalEventPath: filepath.Join(config.HomeDir(), "pending-terminal-events.jsonl"),
 		HTTPClient: &http.Client{
 			Timeout: 15 * time.Second,
 		},
@@ -340,6 +341,7 @@ func (s *Service) Run(ctx context.Context) error {
 	go func() {
 		errCh <- s.runTaskLoop(ctx)
 	}()
+	go s.runPendingTerminalEventLoop(ctx)
 	go func() {
 		errCh <- s.runFSTaskLoop(ctx)
 	}()

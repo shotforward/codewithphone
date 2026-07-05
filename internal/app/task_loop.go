@@ -73,7 +73,7 @@ func (s *Service) handleDispatch(ctx context.Context, dispatch taskDispatch) err
 	case "claude_code_cli":
 		return s.handleRunnerDispatch(ctx, dispatch, s.claudeRunner)
 	default:
-		return s.serverClient.postEvent(ctx, daemonEvent{SessionID: dispatch.SessionID,
+		return emitTerminalEvent(&s.serverClient, daemonEvent{SessionID: dispatch.SessionID,
 			TaskRunID: dispatch.TaskRunID,
 			EventType: "turn.failed",
 			Payload: map[string]any{
@@ -316,13 +316,19 @@ func (s *Service) handleRunnerDispatch(ctx context.Context, dispatch taskDispatc
 				"tone":   "warning",
 			},
 		}
-		if err := s.serverClient.postEvent(context.Background(), turnCancelled); err != nil {
+		if err := emitTerminalEvent(&s.serverClient, turnCancelled); err != nil {
 			log.Printf("failed to post turn.cancelled event: %v", err)
 		}
 		return nil
 	}
 	if err != nil {
 		snapshot.Cleanup()
+		var terminalErr *terminalEventPostError
+		if errors.As(err, &terminalErr) {
+			log.Printf("terminal event %s already queued for retry taskRun=%s: %v",
+				terminalErr.EventType, dispatch.TaskRunID, terminalErr.Err)
+			return err
+		}
 		failedPayload := map[string]any{
 			"message": err.Error(),
 		}
@@ -332,14 +338,17 @@ func (s *Service) handleRunnerDispatch(ctx context.Context, dispatch taskDispatc
 		if errors.As(err, &rerr) && len(rerr.StderrTail) > 0 {
 			failedPayload["stderrTail"] = rerr.StderrTail
 		}
-		_ = s.serverClient.postEvent(ctx, daemonEvent{
+		if postErr := emitTerminalEvent(&s.serverClient, daemonEvent{
 			SessionID: dispatch.SessionID,
 			TaskRunID: dispatch.TaskRunID,
 			EventType: "turn.failed",
 			Payload:   failedPayload,
-		})
+		}); postErr != nil {
+			log.Printf("failed to post terminal turn.failed event taskRun=%s: %v", dispatch.TaskRunID, postErr)
+		}
 		return err
 	}
+	s.ensureSuccessfulDispatchTerminal(ctx, dispatch, nextRef)
 
 	if !profile.TrackChanges {
 		snapshot.Cleanup()
@@ -366,6 +375,40 @@ func (s *Service) handleRunnerDispatch(ctx context.Context, dispatch taskDispatc
 	// Hand off to background goroutine — does NOT block the task loop.
 	s.startChangeSetWaiter(dispatch, snapshot, changeSet)
 	return nil
+}
+
+func (s *Service) ensureSuccessfulDispatchTerminal(ctx context.Context, dispatch taskDispatch, providerSessionRef string) {
+	if strings.TrimSpace(dispatch.TaskRunID) == "" {
+		return
+	}
+	statusCtx, cancel := context.WithTimeout(ctx, 8*time.Second)
+	status, err := s.serverClient.fetchTaskStatus(statusCtx, dispatch.TaskRunID)
+	cancel()
+	if err != nil {
+		log.Printf("post-run task status check failed taskRun=%s: %v", dispatch.TaskRunID, err)
+		return
+	}
+	switch strings.TrimSpace(status) {
+	case "queued", "dispatched", "running", "waiting_user":
+	default:
+		return
+	}
+	payload := map[string]any{
+		"status":           "completed",
+		"completionReason": "daemon_terminal_repair",
+	}
+	if ref := strings.TrimSpace(providerSessionRef); ref != "" {
+		payload["providerSessionRef"] = ref
+		payload["sessionId"] = ref
+	}
+	if err := emitTerminalEvent(&s.serverClient, daemonEvent{
+		SessionID: dispatch.SessionID,
+		TaskRunID: dispatch.TaskRunID,
+		EventType: "turn.completed",
+		Payload:   payload,
+	}); err != nil {
+		log.Printf("post-run terminal repair failed taskRun=%s status=%s: %v", dispatch.TaskRunID, status, err)
+	}
 }
 
 func (s *Service) startGeminiFileTouchedWatcher(ctx context.Context, dispatch taskDispatch) func() {

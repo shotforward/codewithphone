@@ -427,12 +427,15 @@ func (r *claudeRunner) RunTurn(ctx context.Context, dispatch taskDispatch, provi
 		completedPayload["providerSessionRef"] = strings.TrimSpace(sessionID)
 		completedPayload["sessionId"] = strings.TrimSpace(sessionID)
 	}
-	_ = r.server.postEvent(ctx, daemonEvent{
+	if err := emitTerminalEvent(r.server, daemonEvent{
 		SessionID: dispatch.SessionID,
 		TaskRunID: dispatch.TaskRunID,
 		EventType: "turn.completed",
 		Payload:   completedPayload,
-	})
+	}); err != nil {
+		log.Printf("claude terminal turn.completed post failed taskRun=%s: %v", dispatch.TaskRunID, err)
+		return sessionID, err
+	}
 
 	return sessionID, nil
 }

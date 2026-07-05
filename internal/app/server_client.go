@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"strings"
 	"time"
@@ -68,10 +70,11 @@ type recoverTasksResponse struct {
 }
 
 type serverClient struct {
-	BaseURL      string
-	MachineID    string
-	MachineToken string
-	HTTPClient   *http.Client
+	BaseURL                  string
+	MachineID                string
+	MachineToken             string
+	HTTPClient               *http.Client
+	PendingTerminalEventPath string
 }
 
 type httpStatusError struct {
@@ -86,6 +89,11 @@ func (e *httpStatusError) Error() string {
 	}
 	return fmt.Sprintf("%s failed: %d (%s)", e.Op, e.StatusCode, strings.TrimSpace(e.Body))
 }
+
+const (
+	postEventAttempts    = 3
+	postEventBaseBackoff = 500 * time.Millisecond
+)
 
 func (c serverClient) claimTask(ctx context.Context) (*taskDispatch, error) {
 	url := strings.TrimRight(c.BaseURL, "/") + "/v1/machines/" + c.MachineID + "/tasks/claim"
@@ -119,21 +127,39 @@ func (c serverClient) claimTask(ctx context.Context) (*taskDispatch, error) {
 }
 
 func (c serverClient) postEvent(ctx context.Context, evt daemonEvent) error {
-	if evt.EventID == "" {
-		evt.EventID = fmt.Sprintf("evt_%d", time.Now().UnixNano())
-	}
-	if evt.MachineID == "" {
-		evt.MachineID = c.MachineID
-	}
-	if evt.OccurredAt == "" {
-		evt.OccurredAt = time.Now().UTC().Format(time.RFC3339)
-	}
+	evt = c.normalizeEvent(evt)
 
 	body, err := json.Marshal(evt)
 	if err != nil {
 		return err
 	}
 	url := strings.TrimRight(c.BaseURL, "/") + "/v1/machines/" + c.MachineID + "/events"
+
+	var lastErr error
+	for attempt := 1; attempt <= postEventAttempts; attempt++ {
+		err := c.postEventOnce(ctx, evt, url, body)
+		if err == nil {
+			return nil
+		}
+		lastErr = err
+		if !isRetryablePostEventError(err) || attempt == postEventAttempts || ctx.Err() != nil {
+			break
+		}
+		backoff := time.Duration(attempt) * postEventBaseBackoff
+		debugLogf("postEvent retry eventType=%s taskRun=%s attempt=%d/%d err=%v backoff=%s",
+			evt.EventType, evt.TaskRunID, attempt+1, postEventAttempts, err, backoff)
+		timer := time.NewTimer(backoff)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
+	return lastErr
+}
+
+func (c serverClient) postEventOnce(ctx context.Context, evt daemonEvent, url string, body []byte) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
 		return err
@@ -157,6 +183,44 @@ func (c serverClient) postEvent(ctx context.Context, evt daemonEvent) error {
 		return newHTTPStatusError("post event", resp)
 	}
 	return nil
+}
+
+func isRetryablePostEventError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.Canceled) {
+		return false
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return true
+	}
+	var statusErr *httpStatusError
+	if errors.As(err, &statusErr) {
+		if statusErr.StatusCode == http.StatusTooManyRequests || statusErr.StatusCode >= 500 {
+			return true
+		}
+		body := strings.ToLower(statusErr.Body)
+		return strings.Contains(body, "deadlock") || strings.Contains(body, "lock wait timeout")
+	}
+	return false
+}
+
+func (c serverClient) normalizeEvent(evt daemonEvent) daemonEvent {
+	if evt.EventID == "" {
+		evt.EventID = fmt.Sprintf("evt_%d", time.Now().UnixNano())
+	}
+	if evt.MachineID == "" {
+		evt.MachineID = c.MachineID
+	}
+	if evt.OccurredAt == "" {
+		evt.OccurredAt = time.Now().UTC().Format(time.RFC3339)
+	}
+	return evt
 }
 
 func (c serverClient) claimFSTask(ctx context.Context) (*fsTaskDispatch, error) {

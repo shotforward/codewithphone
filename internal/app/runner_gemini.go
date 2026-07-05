@@ -489,12 +489,15 @@ deny_message = "No user interactive console is available. Use mcp_pocketcode_run
 		completedPayload["providerSessionRef"] = strings.TrimSpace(sessionID)
 		completedPayload["sessionId"] = strings.TrimSpace(sessionID)
 	}
-	_ = r.server.postEvent(ctx, daemonEvent{
+	if err := emitTerminalEvent(r.server, daemonEvent{
 		SessionID: dispatch.SessionID,
 		TaskRunID: dispatch.TaskRunID,
 		EventType: "turn.completed",
 		Payload:   completedPayload,
-	})
+	}); err != nil {
+		log.Printf("gemini terminal turn.completed post failed taskRun=%s: %v", dispatch.TaskRunID, err)
+		return sessionID, err
+	}
 
 	return sessionID, nil
 }

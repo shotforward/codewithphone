@@ -18,6 +18,57 @@ const (
 	turnPhaseFinalizing   = "finalizing"
 )
 
+const (
+	terminalEventPostAttempts = 3
+	terminalEventPostTimeout  = 12 * time.Second
+)
+
+type terminalEventPostError struct {
+	EventType string
+	Err       error
+}
+
+func (e *terminalEventPostError) Error() string {
+	if e == nil || e.Err == nil {
+		return "terminal event post failed"
+	}
+	return e.Err.Error()
+}
+
+func (e *terminalEventPostError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.Err
+}
+
+func emitTerminalEvent(server *serverClient, event daemonEvent) error {
+	if server == nil {
+		return nil
+	}
+	event = server.normalizeEvent(event)
+	var lastErr error
+	for attempt := 1; attempt <= terminalEventPostAttempts; attempt++ {
+		ctx, cancel := context.WithTimeout(context.Background(), terminalEventPostTimeout)
+		err := server.postEvent(ctx, event)
+		cancel()
+		if err == nil {
+			return nil
+		}
+		lastErr = err
+		if attempt < terminalEventPostAttempts {
+			log.Printf("terminal event %s post failed attempt=%d/%d taskRun=%s: %v",
+				event.EventType, attempt, terminalEventPostAttempts, event.TaskRunID, err)
+			time.Sleep(time.Duration(attempt) * 750 * time.Millisecond)
+		}
+	}
+	if enqueueErr := server.enqueuePendingTerminalEvent(event, lastErr); enqueueErr != nil {
+		log.Printf("failed to enqueue pending terminal event taskRun=%s event=%s err=%v originalErr=%v",
+			event.TaskRunID, event.EventType, enqueueErr, lastErr)
+	}
+	return &terminalEventPostError{EventType: event.EventType, Err: lastErr}
+}
+
 func emitTurnPhase(ctx context.Context, server *serverClient, dispatch taskDispatch, phase string, extra map[string]any) error {
 	normalized := normalizeTurnPhase(phase)
 	if normalized == "" {

@@ -191,7 +191,7 @@ func (r *codexRunner) RunTurn(ctx context.Context, dispatch taskDispatch, provid
 		if err := profile.RunBeforeComplete(ctx); err != nil {
 			log.Printf("[CHANGESET] codex runner beforeComplete hook failed: %v", err)
 		}
-		if err := r.server.postEvent(ctx, daemonEvent{
+		if err := emitTerminalEvent(r.server, daemonEvent{
 			SessionID: dispatch.SessionID,
 			TaskRunID: dispatch.TaskRunID,
 			EventType: "turn.completed",
@@ -222,7 +222,7 @@ func (r *codexRunner) RunTurn(ctx context.Context, dispatch taskDispatch, provid
 			if err := profile.RunBeforeComplete(ctx); err != nil {
 				log.Printf("[CHANGESET] codex runner beforeComplete hook failed: %v", err)
 			}
-			if err := r.server.postEvent(ctx, daemonEvent{
+			if err := emitTerminalEvent(r.server, daemonEvent{
 				SessionID: dispatch.SessionID,
 				TaskRunID: dispatch.TaskRunID,
 				EventType: "turn.completed",
@@ -306,7 +306,7 @@ func (r *codexRunner) handleAsyncMessage(ctx context.Context, rpc *codexRPCClien
 			if err := profile.RunBeforeComplete(ctx); err != nil {
 				log.Printf("[CHANGESET] codex runner beforeComplete hook failed: %v", err)
 			}
-			return true, r.server.postEvent(ctx, daemonEvent{
+			return true, emitTerminalEvent(r.server, daemonEvent{
 				SessionID: dispatch.SessionID,
 				TaskRunID: dispatch.TaskRunID,
 				EventType: "turn.completed",
@@ -317,7 +317,7 @@ func (r *codexRunner) handleAsyncMessage(ctx context.Context, rpc *codexRPCClien
 				},
 			})
 		}
-		return true, r.server.postEvent(ctx, daemonEvent{
+		return true, emitTerminalEvent(r.server, daemonEvent{
 			SessionID: dispatch.SessionID,
 			TaskRunID: dispatch.TaskRunID,
 			EventType: "turn.failed",
@@ -346,7 +346,7 @@ func (r *codexRunner) handleAsyncMessage(ctx context.Context, rpc *codexRPCClien
 		log.Printf("[CODEX] error notification: %s (code=%s, taskRun=%s)", errMsg, errPayload.Code, dispatch.TaskRunID)
 		deltaBuf.Flush(ctx)
 		r.closeAssistantStream(ctx, dispatch, state, "")
-		return true, r.server.postEvent(ctx, daemonEvent{
+		return true, emitTerminalEvent(r.server, daemonEvent{
 			SessionID: dispatch.SessionID,
 			TaskRunID: dispatch.TaskRunID,
 			EventType: "turn.failed",
