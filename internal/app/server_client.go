@@ -20,27 +20,40 @@ type machineInventory struct {
 }
 
 type taskDispatch struct {
-	TaskRunID          string `json:"taskRunId"`
-	SessionID          string `json:"sessionId"`
-	TemplateID         string `json:"templateId,omitempty"`
-	AgentSessionID     string `json:"agentSessionId,omitempty"`
-	AgentID            string `json:"agentId,omitempty"`
-	AgentDisplayName   string `json:"agentDisplayName,omitempty"`
-	AgentMention       string `json:"agentMention,omitempty"`
-	RunSegmentID       string `json:"runSegmentId,omitempty"`
-	Mode               string `json:"mode,omitempty"`
-	ProviderSessionKey string `json:"providerSessionKey,omitempty"`
-	ProviderSessionRef string `json:"providerSessionRef,omitempty"`
-	Runtime            string `json:"runtime"`
-	Model              string `json:"model,omitempty"`
-	WorkspaceRoot      string `json:"workspaceRoot"`
-	Prompt             string `json:"prompt"`
+	TaskRunID          string              `json:"taskRunId"`
+	SessionID          string              `json:"sessionId"`
+	TemplateID         string              `json:"templateId,omitempty"`
+	AgentSessionID     string              `json:"agentSessionId,omitempty"`
+	AgentID            string              `json:"agentId,omitempty"`
+	AgentDisplayName   string              `json:"agentDisplayName,omitempty"`
+	AgentMention       string              `json:"agentMention,omitempty"`
+	RunSegmentID       string              `json:"runSegmentId,omitempty"`
+	Mode               string              `json:"mode,omitempty"`
+	ProviderSessionKey string              `json:"providerSessionKey,omitempty"`
+	ProviderSessionRef string              `json:"providerSessionRef,omitempty"`
+	Runtime            string              `json:"runtime"`
+	Model              string              `json:"model,omitempty"`
+	WorkspaceRoot      string              `json:"workspaceRoot"`
+	Prompt             string              `json:"prompt"`
+	Attachments        []messageAttachment `json:"attachments,omitempty"`
 
 	// WorkspaceSnapshotRoot is the local path to the snapshot of the
 	// workspace taken at turn start. Used by file.touched emitters to
 	// compute "diff vs turn start" cumulative diffs at write time. Empty
 	// when the turn profile has TrackChanges disabled.
 	WorkspaceSnapshotRoot string `json:"-"`
+}
+
+type messageAttachment struct {
+	ID        string `json:"id"`
+	Type      string `json:"type"`
+	MimeType  string `json:"mimeType"`
+	Filename  string `json:"filename,omitempty"`
+	SizeBytes int64  `json:"sizeBytes"`
+	ObjectKey string `json:"objectKey"`
+	URL       string `json:"url"`
+	LocalPath string `json:"-"`
+	LocalData string `json:"-"`
 }
 
 type fsTaskDispatch struct {

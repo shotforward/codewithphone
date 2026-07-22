@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
@@ -168,16 +169,19 @@ func (r *codexRunner) RunTurn(ctx context.Context, dispatch taskDispatch, provid
 	}
 	debugLogf("[TIMING] codex openThread: %v", time.Since(t2))
 
+	imageAttachments, imageTempDir, err := prepareImageAttachments(ctx, dispatch.Attachments)
+	if err != nil {
+		return threadID, err
+	}
+	if imageTempDir != "" {
+		defer os.RemoveAll(imageTempDir)
+	}
+
 	t3 := time.Now()
 	if _, err := rpc.request(ctx, "turn/start", map[string]any{
 		"threadId": threadID,
 		"cwd":      dispatch.WorkspaceRoot,
-		"input": []map[string]any{
-			{
-				"type": "text",
-				"text": buildTurnPrompt(dispatch.Prompt, profile),
-			},
-		},
+		"input":    buildCodexTurnInput(buildTurnPrompt(dispatch.Prompt, profile), imageAttachments),
 	}, func(msg codexRPCMessage) (bool, error) {
 		return r.handleAsyncMessage(ctx, rpc, dispatch, threadID, profile, state, deltaBuf, msg)
 	}); err != nil {
@@ -240,6 +244,33 @@ func (r *codexRunner) RunTurn(ctx context.Context, dispatch taskDispatch, provid
 			return threadID, nil
 		}
 	}
+}
+
+func buildCodexTurnInput(prompt string, attachments []messageAttachment) []map[string]any {
+	input := []map[string]any{{
+		"type": "text",
+		"text": prompt,
+	}}
+	for _, attachment := range attachments {
+		imageURL := codexImageDataURL(attachment)
+		if imageURL == "" {
+			continue
+		}
+		input = append(input, map[string]any{
+			"type": "image",
+			"url":  imageURL,
+		})
+	}
+	return input
+}
+
+func codexImageDataURL(attachment messageAttachment) string {
+	mimeType := strings.TrimSpace(attachment.MimeType)
+	localData := strings.TrimSpace(attachment.LocalData)
+	if mimeType == "" || localData == "" {
+		return ""
+	}
+	return "data:" + mimeType + ";base64," + localData
 }
 
 func (r *codexRunner) handleAsyncMessage(ctx context.Context, rpc *codexRPCClient, dispatch taskDispatch, threadID string, profile turnExecutionProfile, state *codexTurnState, deltaBuf *EventBuffer, msg codexRPCMessage) (bool, error) {
