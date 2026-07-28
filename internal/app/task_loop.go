@@ -263,15 +263,20 @@ func (s *Service) handleRunnerDispatch(ctx context.Context, dispatch taskDispatc
 			}
 			log.Printf("[CHANGESET] taskRun=%s posting changeset.generated id=%s fileCount=%d summary=%q",
 				dispatch.TaskRunID, cs.ID, cs.ChangedFileCount, cs.Summary)
+			displayFiles, displayStats := changeset.DisplayFiles(cs.Files, changeset.DefaultDisplayFileLimit)
 			if postErr := s.serverClient.postEvent(hookCtx, daemonEvent{
 				SessionID: dispatch.SessionID,
 				TaskRunID: dispatch.TaskRunID,
 				EventType: "changeset.generated",
 				Payload: map[string]any{
-					"changeSetId":      cs.ID,
-					"summary":          cs.Summary,
-					"changedFileCount": cs.ChangedFileCount,
-					"files":            cs.Files,
+					"changeSetId":       cs.ID,
+					"summary":           cs.Summary,
+					"changedFileCount":  cs.ChangedFileCount,
+					"files":             displayFiles,
+					"shownFileCount":    displayStats.ShownFileCount,
+					"hiddenFileCount":   displayStats.HiddenFileCount,
+					"binaryHiddenCount": displayStats.BinaryHiddenCount,
+					"filesTruncated":    displayStats.FilesTruncated,
 				},
 			}); postErr != nil {
 				log.Printf("[CHANGESET] taskRun=%s postEvent(changeset.generated) FAILED: %v (server likely returned non-2xx)", dispatch.TaskRunID, postErr)

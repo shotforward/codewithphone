@@ -278,6 +278,41 @@ func TestBuildFileDiffIncludesHunkForLargeFileTailChange(t *testing.T) {
 	}
 }
 
+func TestDisplayFilesPrioritizesCodeCapsAndHidesBinary(t *testing.T) {
+	files := []File{
+		{Path: "z/config.json", Status: "modified", Diff: "@@\n-json\n+json\n"},
+		{Path: "assets/logo.png", Status: "added", Diff: "diff --git a/assets/logo.png b/assets/logo.png\nBinary files differ\n"},
+		{Path: "src/app.go", Status: "modified", Diff: "@@\n-old\n+new\n"},
+		{Path: "notes.txt", Status: "modified", Diff: "@@\n-old\n+new\n"},
+		{Path: "README.md", Status: "modified", Diff: "@@\n-old\n+new\n"},
+	}
+
+	display, stats := DisplayFiles(files, 3)
+
+	if len(display) != 3 {
+		t.Fatalf("len(display) = %d, want 3", len(display))
+	}
+	gotPaths := []string{display[0].Path, display[1].Path, display[2].Path}
+	wantPaths := []string{"README.md", "src/app.go", "notes.txt"}
+	for i := range wantPaths {
+		if gotPaths[i] != wantPaths[i] {
+			t.Fatalf("display[%d] = %q, want %q (all paths=%v)", i, gotPaths[i], wantPaths[i], gotPaths)
+		}
+	}
+	if stats.ShownFileCount != 3 {
+		t.Fatalf("ShownFileCount = %d, want 3", stats.ShownFileCount)
+	}
+	if stats.HiddenFileCount != 2 {
+		t.Fatalf("HiddenFileCount = %d, want 2", stats.HiddenFileCount)
+	}
+	if stats.BinaryHiddenCount != 1 {
+		t.Fatalf("BinaryHiddenCount = %d, want 1", stats.BinaryHiddenCount)
+	}
+	if !stats.FilesTruncated {
+		t.Fatal("FilesTruncated = false, want true")
+	}
+}
+
 func runGitCommand(dir string, args ...string) error {
 	cmd := exec.Command("git", args...)
 	cmd.Dir = dir

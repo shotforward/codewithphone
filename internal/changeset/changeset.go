@@ -26,6 +26,15 @@ type GeneratedChangeSet struct {
 	Files            []File
 }
 
+const DefaultDisplayFileLimit = 50
+
+type DisplayFileStats struct {
+	ShownFileCount    int
+	HiddenFileCount   int
+	BinaryHiddenCount int
+	FilesTruncated    bool
+}
+
 // changeSetSkipExtensions are file extensions excluded from changesets.
 var changeSetSkipExtensions = map[string]bool{
 	".pyc": true, ".pyo": true, ".class": true,
@@ -37,6 +46,28 @@ var changeSetSkipExtensions = map[string]bool{
 // changeSetSkipNames are exact filenames excluded from changesets.
 var changeSetSkipNames = map[string]bool{
 	".DS_Store": true, "Thumbs.db": true, "desktop.ini": true,
+}
+
+var displayCodeExtensions = map[string]bool{
+	".c": true, ".cc": true, ".cpp": true, ".cs": true, ".css": true,
+	".go": true, ".h": true, ".hpp": true, ".html": true, ".java": true,
+	".js": true, ".jsx": true, ".kt": true, ".kts": true, ".md": true,
+	".php": true, ".py": true, ".rb": true, ".rs": true, ".sh": true,
+	".sql": true, ".swift": true, ".ts": true, ".tsx": true,
+}
+
+var displayConfigExtensions = map[string]bool{
+	".env": true, ".ini": true, ".json": true, ".lock": true, ".properties": true,
+	".text": true, ".toml": true, ".txt": true, ".xml": true, ".yaml": true, ".yml": true,
+}
+
+var displayBinaryExtensions = map[string]bool{
+	".7z": true, ".avi": true, ".bmp": true, ".bz2": true, ".eot": true,
+	".gif": true, ".gz": true, ".ico": true, ".jar": true, ".jpeg": true,
+	".jpg": true, ".mov": true, ".mp3": true, ".mp4": true, ".otf": true,
+	".pdf": true, ".png": true, ".rar": true, ".tar": true, ".tgz": true,
+	".ttf": true, ".webm": true, ".webp": true, ".woff": true, ".woff2": true,
+	".zip": true,
 }
 
 // generatedArtifactDirNames are directory names treated as generated artifacts.
@@ -111,6 +142,60 @@ type File struct {
 type FileDecision struct {
 	Path     string `json:"path"`
 	Decision string `json:"decision"`
+}
+
+func DisplayFiles(files []File, limit int) ([]File, DisplayFileStats) {
+	if limit <= 0 {
+		limit = DefaultDisplayFileLimit
+	}
+	stats := DisplayFileStats{}
+	candidates := make([]File, 0, len(files))
+	for _, file := range files {
+		if isDisplayBinaryFile(file) {
+			stats.BinaryHiddenCount++
+			continue
+		}
+		candidates = append(candidates, file)
+	}
+	sort.SliceStable(candidates, func(i, j int) bool {
+		leftPriority := displayFilePriority(candidates[i].Path)
+		rightPriority := displayFilePriority(candidates[j].Path)
+		if leftPriority != rightPriority {
+			return leftPriority < rightPriority
+		}
+		if candidates[i].Status != candidates[j].Status {
+			return candidates[i].Status < candidates[j].Status
+		}
+		return candidates[i].Path < candidates[j].Path
+	})
+	if len(candidates) > limit {
+		stats.FilesTruncated = true
+		stats.HiddenFileCount += len(candidates) - limit
+		candidates = candidates[:limit]
+	}
+	stats.HiddenFileCount += stats.BinaryHiddenCount
+	stats.ShownFileCount = len(candidates)
+	return candidates, stats
+}
+
+func displayFilePriority(path string) int {
+	ext := strings.ToLower(filepath.Ext(filepath.Base(path)))
+	switch {
+	case displayCodeExtensions[ext]:
+		return 0
+	case displayConfigExtensions[ext]:
+		return 1
+	default:
+		return 2
+	}
+}
+
+func isDisplayBinaryFile(file File) bool {
+	if strings.Contains(file.Diff, "Binary files differ") && !strings.Contains(file.Diff, "@@") {
+		return true
+	}
+	ext := strings.ToLower(filepath.Ext(filepath.Base(file.Path)))
+	return displayBinaryExtensions[ext]
 }
 
 type FileSnapshot struct {
