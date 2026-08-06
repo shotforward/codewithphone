@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log"
 	"os"
 	"path/filepath"
@@ -302,6 +303,52 @@ func (s *Service) handleRunnerDispatch(ctx context.Context, dispatch taskDispatc
 	if nextRef != "" {
 		s.setProviderSession(providerSessionKey, nextRef)
 	}
+	if err != nil {
+		var streamErr *codexStreamDisconnectedError
+		if errors.As(err, &streamErr) {
+			refForFailure := strings.TrimSpace(nextRef)
+			if refForFailure == "" {
+				refForFailure = strings.TrimSpace(providerSessionRef)
+			}
+			failureCount := s.recordCodexStreamFailure(providerSessionKey, refForFailure)
+			if failureCount >= 2 {
+				log.Printf("[CODEX] recovery starting taskRun=%s providerSessionKey=%s oldThread=%s failures=%d",
+					dispatch.TaskRunID, providerSessionKey, refForFailure, failureCount)
+				if postErr := s.serverClient.postEvent(ctx, daemonEvent{
+					SessionID: dispatch.SessionID,
+					TaskRunID: dispatch.TaskRunID,
+					EventType: "turn.recovery.started",
+					Payload: map[string]any{
+						"runtime":               dispatch.Runtime,
+						"reason":                "codex_stream_disconnected",
+						"oldProviderSessionRef": refForFailure,
+						"failureCount":          failureCount,
+					},
+				}); postErr != nil {
+					log.Printf("[CODEX] failed to post recovery start taskRun=%s: %v", dispatch.TaskRunID, postErr)
+				}
+				setPhase(turnPhaseAnalyzing)
+				recoveryDispatch := dispatch
+				recoveryDispatch.ProviderSessionRef = ""
+				recoveryDispatch.Prompt = codexRecoveryPromptForProviderSession(refForFailure, dispatch.Prompt)
+				tRecover := time.Now()
+				recoveredRef, recoverErr := runner.RunTurn(taskCtx, recoveryDispatch, "", profile)
+				debugLogf("[TIMING] codex recovery RunTurn: %v", time.Since(tRecover))
+				if recoveredRef != "" {
+					nextRef = recoveredRef
+					s.setProviderSession(providerSessionKey, recoveredRef)
+				}
+				if recoverErr == nil {
+					log.Printf("[CODEX] recovery completed taskRun=%s oldThread=%s newThread=%s",
+						dispatch.TaskRunID, refForFailure, recoveredRef)
+					s.clearCodexStreamFailure(providerSessionKey)
+					err = nil
+				} else {
+					err = fmt.Errorf("codex recovery failed after stream disconnect: %w", recoverErr)
+				}
+			}
+		}
+	}
 	terminatedRequested := false
 	select {
 	case <-terminated:
@@ -353,6 +400,7 @@ func (s *Service) handleRunnerDispatch(ctx context.Context, dispatch taskDispatc
 		}
 		return err
 	}
+	s.clearCodexStreamFailure(providerSessionKey)
 	s.ensureSuccessfulDispatchTerminal(ctx, dispatch, nextRef)
 
 	if !profile.TrackChanges {

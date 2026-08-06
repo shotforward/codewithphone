@@ -7,6 +7,8 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -59,6 +61,19 @@ func (r agentSessionRecordingRunner) RunTurn(_ context.Context, dispatch taskDis
 	return "thr_group", nil
 }
 
+type codexRecoveryRecordingRunner struct {
+	calls chan turnExecutionCall
+	count atomic.Int32
+}
+
+func (r *codexRecoveryRecordingRunner) RunTurn(_ context.Context, dispatch taskDispatch, providerSessionRef string, profile turnExecutionProfile) (string, error) {
+	r.calls <- turnExecutionCall{Dispatch: dispatch, ProviderSessionRef: providerSessionRef, Profile: profile}
+	if r.count.Add(1) <= 2 {
+		return "thr_old", &codexStreamDisconnectedError{Message: "Reconnecting... 2/5"}
+	}
+	return "thr_new", nil
+}
+
 func TestRunTaskLoopClaimsTaskAndInvokesRunner(t *testing.T) {
 	var claimed atomic.Bool
 	workspaceRoot := t.TempDir()
@@ -91,7 +106,7 @@ func TestRunTaskLoopClaimsTaskAndInvokesRunner(t *testing.T) {
 
 	calls := make(chan taskDispatch, 1)
 	svc := &Service{
-		cfg:              configFixture(),
+		cfg:              configFixture(t),
 		providerSessions: map[string]string{},
 		serverClient: serverClient{
 			BaseURL:    server.URL,
@@ -150,7 +165,7 @@ func TestHandleCodexDispatchReusesStoredProviderSession(t *testing.T) {
 	defer server.Close()
 
 	svc := &Service{
-		cfg:              configFixture(),
+		cfg:              configFixture(t),
 		providerSessions: map[string]string{},
 		serverClient: serverClient{
 			BaseURL:    server.URL,
@@ -223,7 +238,7 @@ func TestHandleCodexDispatchRepairsMissingTerminalEvent(t *testing.T) {
 	defer server.Close()
 
 	svc := &Service{
-		cfg:              configFixture(),
+		cfg:              configFixture(t),
 		providerSessions: map[string]string{},
 		serverClient: serverClient{
 			BaseURL:    server.URL,
@@ -287,7 +302,7 @@ func TestHandleCodexDispatchScopesProviderSessionByAgentSession(t *testing.T) {
 	defer server.Close()
 
 	svc := &Service{
-		cfg:              configFixture(),
+		cfg:              configFixture(t),
 		providerSessions: map[string]string{},
 		serverClient: serverClient{
 			BaseURL:    server.URL,
@@ -365,7 +380,7 @@ func TestHandleCodexDispatchUsesServerProviderSessionRefWhenLocalStateMissing(t 
 	defer server.Close()
 
 	svc := &Service{
-		cfg:              configFixture(),
+		cfg:              configFixture(t),
 		providerSessions: map[string]string{},
 		serverClient: serverClient{
 			BaseURL:    server.URL,
@@ -393,6 +408,156 @@ func TestHandleCodexDispatchUsesServerProviderSessionRefWhenLocalStateMissing(t 
 	}
 	if got := svc.getProviderSession("agent:asess_pm"); got != "thr_from_server" {
 		t.Fatalf("expected server provider session ref to be cached locally, got %q", got)
+	}
+}
+
+func TestHandleCodexDispatchRecoversOnSecondStreamDisconnect(t *testing.T) {
+	calls := make(chan turnExecutionCall, 4)
+	events := make(chan daemonEvent, 20)
+	workspaceRoot := t.TempDir()
+	if err := os.WriteFile(filepath.Join(workspaceRoot, "README.md"), []byte("hello\n"), 0o644); err != nil {
+		t.Fatalf("write workspace file: %v", err)
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/v1/machines/machine-test/events":
+			var event daemonEvent
+			if err := json.NewDecoder(r.Body).Decode(&event); err != nil {
+				t.Fatalf("decode event: %v", err)
+			}
+			events <- event
+			w.WriteHeader(http.StatusAccepted)
+		case strings.HasPrefix(r.URL.Path, "/v1/machines/machine-test/tasks/") && strings.HasSuffix(r.URL.Path, "/status"):
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]string{"status": "running"})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	runner := &codexRecoveryRecordingRunner{calls: calls}
+	svc := &Service{
+		cfg:                 configFixture(t),
+		providerSessions:    map[string]string{"sess_001": "thr_old"},
+		codexStreamFailures: map[string]codexStreamFailureRecord{},
+		sessionLocks:        map[string]*sync.Mutex{},
+		taskWorkspaces:      map[string]string{},
+		taskProfiles:        map[string]turnExecutionProfile{},
+		deniedApprovals:     map[string]map[string]approvalStatus{},
+		pendingSnapshots:    map[string]*pendingChangeSet{},
+		serverClient: serverClient{
+			BaseURL:    server.URL,
+			MachineID:  "machine-test",
+			HTTPClient: server.Client(),
+		},
+		codexRunner: runner,
+		changeSets: changeSetClient{
+			BaseURL:    server.URL,
+			HTTPClient: server.Client(),
+		},
+	}
+
+	firstDispatch := taskDispatch{
+		TaskRunID:     "task_first",
+		SessionID:     "sess_001",
+		Runtime:       "codex_cli",
+		WorkspaceRoot: workspaceRoot,
+		Prompt:        "继续",
+	}
+	if err := svc.handleCodexDispatch(context.Background(), firstDispatch); err == nil {
+		t.Fatal("expected first stream disconnect to fail visibly")
+	}
+	if got := <-calls; got.ProviderSessionRef != "thr_old" {
+		t.Fatalf("expected first call to resume old thread, got %q", got.ProviderSessionRef)
+	}
+	firstEvents := drainEvents(events)
+	if !eventTypeSeen(firstEvents, "task_first", "turn.failed") {
+		t.Fatal("expected first stream disconnect to emit turn.failed")
+	}
+
+	secondDispatch := firstDispatch
+	secondDispatch.TaskRunID = "task_second"
+	if err := svc.handleCodexDispatch(context.Background(), secondDispatch); err != nil {
+		t.Fatalf("expected second stream disconnect to recover, got %v", err)
+	}
+	firstRecoveryCall := <-calls
+	if firstRecoveryCall.ProviderSessionRef != "thr_old" {
+		t.Fatalf("expected second dispatch to first try old thread, got %q", firstRecoveryCall.ProviderSessionRef)
+	}
+	secondRecoveryCall := <-calls
+	if secondRecoveryCall.ProviderSessionRef != "" {
+		t.Fatalf("expected recovery to start a new thread, got %q", secondRecoveryCall.ProviderSessionRef)
+	}
+	if secondRecoveryCall.Dispatch.Prompt != "继续" {
+		t.Fatalf("expected recovery without local cache to keep original prompt, got %q", secondRecoveryCall.Dispatch.Prompt)
+	}
+	secondEvents := drainEvents(events)
+	if eventTypeSeen(secondEvents, "task_second", "turn.failed") {
+		t.Fatal("did not expect second stream disconnect to emit turn.failed before recovery")
+	}
+	if !eventTypeSeen(secondEvents, "task_second", "turn.recovery.started") {
+		t.Fatal("expected recovery start event")
+	}
+	if got := svc.getProviderSession("sess_001"); got != "thr_new" {
+		t.Fatalf("expected recovered provider session to be stored, got %q", got)
+	}
+}
+
+func drainEvents(events <-chan daemonEvent) []daemonEvent {
+	var drained []daemonEvent
+	for {
+		select {
+		case event := <-events:
+			drained = append(drained, event)
+		default:
+			return drained
+		}
+	}
+}
+
+func eventTypeSeen(events []daemonEvent, taskRunID, eventType string) bool {
+	for _, event := range events {
+		if event.TaskRunID == taskRunID && event.EventType == eventType {
+			return true
+		}
+	}
+	return false
+}
+
+func TestExtractCodexRecoveryContextFromReaderUsesVisibleMessagesAfterCompaction(t *testing.T) {
+	input := strings.Join([]string{
+		`{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"old user"}]}}`,
+		`{"type":"compacted","payload":{"replacement_history":[]}}`,
+		`{"type":"response_item","payload":{"type":"message","role":"developer","content":[{"type":"input_text","text":"secret developer instruction"}]}}`,
+		`{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"new user"},{"type":"input_image"}]}}`,
+		`{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"new assistant"}]}}`,
+	}, "\n")
+	got, err := extractCodexRecoveryContextFromReader(strings.NewReader(input))
+	if err != nil {
+		t.Fatalf("extract recovery context: %v", err)
+	}
+	if strings.Contains(got, "old user") || strings.Contains(got, "secret developer instruction") {
+		t.Fatalf("unexpected stale or developer content in recovery context: %q", got)
+	}
+	for _, want := range []string{"user:", "new user", "[image attachments in prior turn: 1]", "assistant:", "new assistant"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("expected %q in recovery context, got %q", want, got)
+		}
+	}
+}
+
+func TestParseCodexErrorNotificationReadsRetryableNestedError(t *testing.T) {
+	raw := json.RawMessage(`{"error":{"message":"Reconnecting... 2/5","codexErrorInfo":{"responseStreamDisconnected":{"httpStatusCode":null}},"additionalDetails":"stream disconnected before completion: websocket closed by server before response.completed"},"willRetry":true,"threadId":"thr_old","turnId":"turn_001"}`)
+	got := parseCodexErrorNotification(raw)
+	if !got.WillRetry {
+		t.Fatal("expected willRetry=true")
+	}
+	if got.Message != "Reconnecting... 2/5" {
+		t.Fatalf("unexpected message %q", got.Message)
+	}
+	if !isCodexResponseStreamDisconnected(string(raw)) {
+		t.Fatal("expected raw payload to be recognized as response stream disconnect")
 	}
 }
 
@@ -440,7 +605,7 @@ func TestRunFSTaskLoopClaimsAndCompletesTask(t *testing.T) {
 	defer server.Close()
 
 	svc := &Service{
-		cfg:          configFixture(),
+		cfg:          configFixture(t),
 		allowedRoots: []string{workspaceRoot},
 		serverClient: serverClient{
 			BaseURL:    server.URL,
@@ -485,7 +650,9 @@ func TestRunFSTaskLoopClaimsAndCompletesTask(t *testing.T) {
 	}
 }
 
-func configFixture() config.Config {
+func configFixture(t *testing.T) config.Config {
+	t.Helper()
+	t.Setenv("CODEWITHPHONE_HOME", t.TempDir())
 	return config.Config{
 		HTTPAddr:           "127.0.0.1:0",
 		MachineID:          "machine-test",

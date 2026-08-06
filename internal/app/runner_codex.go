@@ -365,11 +365,7 @@ func (r *codexRunner) handleAsyncMessage(ctx context.Context, rpc *codexRPCClien
 		// wrong (e.g. API key invalid, model error, rate limit). Log the
 		// full payload and emit turn.failed so the user sees the error
 		// instead of the turn hanging forever.
-		var errPayload struct {
-			Message string `json:"message"`
-			Code    string `json:"code"`
-		}
-		_ = json.Unmarshal(msg.Params, &errPayload)
+		errPayload := parseCodexErrorNotification(msg.Params)
 		errMsg := errPayload.Message
 		if errMsg == "" {
 			errMsg = string(msg.Params)
@@ -377,6 +373,12 @@ func (r *codexRunner) handleAsyncMessage(ctx context.Context, rpc *codexRPCClien
 		log.Printf("[CODEX] error notification: %s (code=%s, taskRun=%s)", errMsg, errPayload.Code, dispatch.TaskRunID)
 		deltaBuf.Flush(ctx)
 		r.closeAssistantStream(ctx, dispatch, state, "")
+		if isCodexResponseStreamDisconnected(errMsg) || isCodexResponseStreamDisconnected(string(msg.Params)) {
+			if errPayload.WillRetry {
+				return false, nil
+			}
+			return true, &codexStreamDisconnectedError{Message: errMsg, Raw: string(msg.Params)}
+		}
 		return true, emitTerminalEvent(r.server, daemonEvent{
 			SessionID: dispatch.SessionID,
 			TaskRunID: dispatch.TaskRunID,

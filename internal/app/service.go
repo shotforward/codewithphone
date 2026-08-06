@@ -55,6 +55,7 @@ type Service struct {
 	mu                     sync.Mutex
 	actualAddr             string // resolved listen address (useful when port=0)
 	providerSessions       map[string]string
+	codexStreamFailures    map[string]codexStreamFailureRecord
 	sessionWorkspaces      map[string]string      // sessionID -> first workspaceRoot
 	sessionLocks           map[string]*sync.Mutex // per-session lock for serial task execution
 	taskWorkspaces         map[string]string      // taskRunID -> workspaceRoot
@@ -130,6 +131,7 @@ func New(cfg config.Config, opts ...Option) *Service {
 		cfg:                    cfg,
 		interactive:            true, // default: foreground with terminal
 		providerSessions:       map[string]string{},
+		codexStreamFailures:    map[string]codexStreamFailureRecord{},
 		sessionWorkspaces:      map[string]string{},
 		sessionLocks:           map[string]*sync.Mutex{},
 		taskWorkspaces:         map[string]string{},
